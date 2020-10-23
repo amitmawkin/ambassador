@@ -15,9 +15,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/gogo/protobuf/types"
+	"github.com/golang/protobuf/ptypes"
 
-	envoy_api_v2 "github.com/datawire/ambassador/pkg/api/envoy/api/v2"
+	v2 "github.com/datawire/ambassador/pkg/api/envoy/api/v2"
 )
 
 // ensure the imports are used
@@ -32,10 +32,13 @@ var (
 	_ = time.Duration(0)
 	_ = (*url.URL)(nil)
 	_ = (*mail.Address)(nil)
-	_ = types.DynamicAny{}
+	_ = ptypes.DynamicAny{}
 
-	_ = envoy_api_v2.Cluster_DnsLookupFamily(0)
+	_ = v2.Cluster_DnsLookupFamily(0)
 )
+
+// define the regex for a UUID once up-front
+var _dns_cache_uuidPattern = regexp.MustCompile("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 // Validate checks the field values on DnsCacheConfig with the rules defined in
 // the proto definition for this message. If any rules are violated, an error
@@ -52,7 +55,7 @@ func (m *DnsCacheConfig) Validate() error {
 		}
 	}
 
-	if _, ok := envoy_api_v2.Cluster_DnsLookupFamily_name[int32(m.GetDnsLookupFamily())]; !ok {
+	if _, ok := v2.Cluster_DnsLookupFamily_name[int32(m.GetDnsLookupFamily())]; !ok {
 		return DnsCacheConfigValidationError{
 			field:  "DnsLookupFamily",
 			reason: "value must be one of the defined enum values",
@@ -60,7 +63,7 @@ func (m *DnsCacheConfig) Validate() error {
 	}
 
 	if d := m.GetDnsRefreshRate(); d != nil {
-		dur, err := types.DurationFromProto(d)
+		dur, err := ptypes.Duration(d)
 		if err != nil {
 			return DnsCacheConfigValidationError{
 				field:  "DnsRefreshRate",
@@ -69,19 +72,19 @@ func (m *DnsCacheConfig) Validate() error {
 			}
 		}
 
-		gt := time.Duration(0*time.Second + 0*time.Nanosecond)
+		gte := time.Duration(0*time.Second + 1000000*time.Nanosecond)
 
-		if dur <= gt {
+		if dur < gte {
 			return DnsCacheConfigValidationError{
 				field:  "DnsRefreshRate",
-				reason: "value must be greater than 0s",
+				reason: "value must be greater than or equal to 1ms",
 			}
 		}
 
 	}
 
 	if d := m.GetHostTtl(); d != nil {
-		dur, err := types.DurationFromProto(d)
+		dur, err := ptypes.Duration(d)
 		if err != nil {
 			return DnsCacheConfigValidationError{
 				field:  "HostTtl",
@@ -110,6 +113,16 @@ func (m *DnsCacheConfig) Validate() error {
 			}
 		}
 
+	}
+
+	if v, ok := interface{}(m.GetDnsFailureRefreshRate()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return DnsCacheConfigValidationError{
+				field:  "DnsFailureRefreshRate",
+				reason: "embedded message failed validation",
+				cause:  err,
+			}
+		}
 	}
 
 	return nil

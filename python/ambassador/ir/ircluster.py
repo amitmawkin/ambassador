@@ -38,7 +38,7 @@ if TYPE_CHECKING:
 
 
 class IRCluster (IRResource):
-    def __init__(self, ir: 'IR', aconf: Config,
+    def __init__(self, ir: 'IR', aconf: Config, parent_ir_resource: 'IRResource',
                  location: str,  # REQUIRED
 
                  service: str,   # REQUIRED
@@ -62,7 +62,7 @@ class IRCluster (IRResource):
 
                  rkey: str="-override-",
                  kind: str="IRCluster",
-                 apiVersion: str="ambassador/v0",   # Not a typo! See below.
+                 apiVersion: str="getambassador.io/v0",   # Not a typo! See below.
                  **kwargs) -> None:
         # Step one: look at the service and such and figure out a cluster name
         # and TLS origination info.
@@ -172,6 +172,17 @@ class IRCluster (IRResource):
         # p is read-only, so break stuff out.
 
         hostname = p.hostname
+        namespace = parent_ir_resource.namespace
+        # Make sure we save the namespace in the cluster name, to prevent clashes with non-fully qualified service resolution
+        name_fields.append(namespace)
+
+        # Do we actually have a hostname?
+        if not hostname:
+            # We don't. That ain't good.
+            errors.append("service %s has no hostname and will be ignored; please re-configure" % service)
+            self.ignore_cluster = True
+            hostname = "unknown"
+
         try:
             port = p.port
         except ValueError as e:
@@ -260,7 +271,7 @@ class IRCluster (IRResource):
         new_args: Dict[str, Any] = {
             "type": dns_type,
             "lb_type": lb_type,
-            "urls": [ url ],
+            "urls": [ url ],  # TODO: Should we completely eliminate `urls` in favor of `targets`?
             "load_balancer": load_balancer,
             "keepalive": keepalive,
             "circuit_breakers": circuit_breakers,
@@ -290,7 +301,12 @@ class IRCluster (IRResource):
         # Stash the resolver, hostname, and port for setup.
         self._resolver = resolver
         self._hostname = hostname
+        self._namespace = namespace
         self._port = port
+        self._is_sidecar = False
+
+        if self._hostname == '127.0.0.1' and self._port == 8500:
+            self._is_sidecar = True
 
         super().__init__(
             ir=ir, aconf=aconf, rkey=rkey, location=location,
@@ -306,11 +322,13 @@ class IRCluster (IRResource):
                 ir.post_error(error, resource=self)
 
     def setup(self, ir: 'IR', aconf: Config) -> bool:
+        self._cache_key = f"Cluster-{self.name}"
+
         if self.ignore_cluster:
             return False
 
         # Resolve our actual targets.
-        targets = ir.resolve_targets(self, self._resolver, self._hostname, self._port)
+        targets = ir.resolve_targets(self, self._resolver, self._hostname, self._namespace, self._port)
 
         if targets:
             # Great.
@@ -325,6 +343,9 @@ class IRCluster (IRResource):
             return False
 
         return True
+
+    def is_edge_stack_sidecar(self) -> bool:
+        return self.is_active() and self._is_sidecar
 
     def endpoints_required(self, load_balancer) -> bool:
         required = False

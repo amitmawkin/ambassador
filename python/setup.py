@@ -39,7 +39,7 @@ kat_files = [
     for subdirpath, folders, filenames in os.walk("kat")
 ]
 
-data_files = template_files + schema_files + kat_files
+data_files = [("", ["ambassador.version"])] + template_files + schema_files + kat_files
 
 setup(
     name="ambassador",
@@ -54,9 +54,12 @@ setup(
 
     entry_points={
         'console_scripts': [
-            'ambassador=ambassador.cli:main',
-            'diagd=ambassador_diag.diagd:main'
-      ]
+            'ambassador=ambassador_cli.ambassador:main',
+            'diagd=ambassador_diag.diagd:main',
+            'mockery=ambassador_cli.mockery:main',
+            'grab-snapshots=ambassador_cli.grab_snapshots:main',
+            'ert=ambassador_cli.ert:main'
+        ]
     },
 
     author="datawire.io",

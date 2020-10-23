@@ -13,13 +13,13 @@ Note. PRs will pile up on `master`. **Don't accept PRs for which CI doesn't show
 When we get to the stage of creating a release, all the PRs that we want to merge will have been merged
 and the CI will be green.
 
-1. Once `master` has all the release drivers, tag `master` with an RC tag, e.g. `v0.77.0-rc1`. **This version tag must start with a 'v'.** For example:
-    git tag v0.77.0-rc1 master
+1. Once `master` has all the release drivers, tag `master` with an RC tag, e.g. `v0.77.0-rc.1`. **This version tag must start with a 'v'.** For example:
+    git tag v0.77.0-rc.1 master
     git push --tags origin master
 
 2. The RC tag will trigger CI to run a new build and new tests. It had better pass: if not, figure out why. Monitor https://travis-ci.com/datawire/amabassador/ until the CI for ambassador completes and is green.
 
-3. The RC build will be available as e.g. `quay.io/datawire/ambassador:0.77.0-rc1` and also as e.g. `quay.io/datawire/ambassador:0.77.0-rc-latest`. Any other testing you want to do against this image, rock on.
+3. The RC build will be available as e.g. `docker.io/datawire/ambassador:0.77.0-rc.1` and also as e.g. `docker.io/datawire/ambassador:0.77.0-rc-latest`. Any other testing you want to do against this image, rock on.
 
 4. When you're happy that the RC is ready for GA, **first** assemble the list of changes that you'll put into CHANGELOG.md: (Note: place this list in a separate file, maybe `~/temp-list.txt`, but definitely not in CHANGELOG.md at this time.
    - We always call out things contributed by the community, including who committed it
@@ -86,6 +86,109 @@ and the CI will be green.
       - `CurrentVersion` is e.g. "0.78.0" -- no leading 'v' here
       - `BlogLink` is the full URL of the blog post (from Marketing), or "" if there is no blog post
    - Make your edits, submit a PR, get it merged. Done.
-      - If you want to test before submitting, use `npm install && npm start` and point a web browser to `localhost:8000`
+      - If you want to test before submitting, use `yarn install && yarn start` and point a web browser to `localhost:8000`
 
    Submit a PR to the Ambassador website repository to update the version on the homepage.
+
+---
+
+### Host a release branch on getambassador.io
+
+getambassador.io can host multiple versions of ambassador documentation. As a matter of policy, only the documentation for major and minor releases is hosted, documentation changes for patch releases are expected to be folded in the associated minor release.
+
+#### Introduction
+
+Whenever a new release is cut in ambassador, a release branch is created for that release. Generally these release branches are named as `release/v<release version>`.
+A major and a minor release branch is expected to be long lived, protected and it contains the documentation for that particular branch under `/docs/` directory.
+
+To host these different versions of documentation on the website, the following machinery is set up.
+
+In getambassador.io.git repository:
+
+- The release branches are exposed via git submodules under /submodules/ directory.
+```
+submodules/
+├── 1.3 <--- links to `release/v1.3` branch
+├── 1.4 <--- links to `release/v1.4` branch
+├── 1.5 <--- links to `release/v1.5` branch
+├── latest <--- links to `release/v1.5` branch
+└── pre-release <--- links to `master` branch
+```
+- All markdown files under `/docs-structure/` directory make their way to the getambassador.io website with the _exact_ path as they are in.
+```
+docs-structure/
+├── docs <--- This is where we want to expose the /docs/ directory from our release branches
+├── edgestack.me
+├── kat
+├── libraries.md
+├── README.md
+└── yaml -> ../submodules/latest/docs/yaml/
+```
+- Now that we have all release branches under `/submodules/`, we further link their `/docs/` directories under `/docs-structure/docs/`.
+```
+docs-structure/docs/
+├── 1.3 -> ../../submodules/1.3/docs
+├── 1.4 -> ../../submodules/1.4/docs
+├── 1.5 -> ../../submodules/1.5/docs
+├── latest -> ../../submodules/1.5/docs
+└── pre-release -> ../../submodules/pre-release/docs
+```
+
+This is how our docs are laid out.
+
+In ambassador.git, the CI is configured to update the submodules in getambassador.io.git on every documentation update to the release branches (and the master branch), which deploys to the website.
+
+#### How to host a new release branch.
+
+After a new major/minor release is cut, this is how to host it on the website.
+For example, let's suppose version 1.6 of ambassador needs to be hosted.
+
+##### In ambassador.git,
+
+- In the branch `release/v1.6`,
+  - In `docs/js/doc-links.yml`, make sure the links are pointed at `/docs/latest/...`
+  - In `docs/js/doc-page.js`, update the footer branch.
+  ```
+  <DocFooter page={page} branch="release/v1.6" />
+  ```
+
+##### In getambassador.io.git,
+- Add the submodule pointing to `release/v1.6` branch to the `submodules/1.6/` directory
+```
+git submodule add --name ambassador-1.6 --branch release/v1.6 https://github.com/datawire/ambassador.git submodules/1.6/
+```
+- Update `ambassador-latest` submodule to point to `release/v1.6` branch.
+```
+$ cat .gitmodules
+[submodule "ambassador-latest"]
+        path = submodules/latest
+        url = https://github.com/datawire/ambassador.git
+        branch = release/v1.6
+...
+...
+...
+```
+- Now link only the docs in this branch under `/docs-structure/docs/` directory.
+```
+cd docs-structure/docs/
+ln -s ../../submodules/1.6/docs 1.6
+```
+- Add 1.6 dropdown link in `src/components/Header/Header.js` file.
+```js
+              <li>
+                <div className={classnames(styles.Dropdown, !isDocLink((location || {}).pathname) && styles.hidden)}>
+                  <button className={classnames(styles.DropdownButton, styles.DocsDropdownColor)}>{ docsVersion((location || {}).pathname) } ▾</button>
+                  <div className={styles.DropdownContent}>
+                    <Link to="/docs/latest/">Pre-release</Link>
+                    <Link to="/docs/latest/">Latest</Link>
+                    <Link to="/docs/1.6/">1.6</Link>
+                    <Link to="/docs/1.5/">1.5</Link>
+                    <Link to="/docs/1.4/">1.4</Link>
+                    <Link to="/docs/1.3/">1.3</Link>
+                  </div>
+                </div>
+              </li>
+```
+
+##### Note:
+Now the website must display v1.6 docs under getambassador.io/docs/1.6/ and getambassador.io/docs/latest/. Make sure everything looks right.

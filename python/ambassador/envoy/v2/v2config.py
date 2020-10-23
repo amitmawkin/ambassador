@@ -12,21 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License
 
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 
 import json
 
-from ...ir import IR
+from ...cache import Cache, NullCache
 
 from ..common import EnvoyConfig, sanitize_pre_json
 from .v2admin import V2Admin
 from .v2bootstrap import V2Bootstrap
 from .v2route import V2Route
-from .v2listener import V2Listener
+from .v2listener import V2Listener, V2TCPListener
 from .v2cluster import V2Cluster
 from .v2_static_resources import V2StaticResources
 from .v2tracing import V2Tracing
 from .v2ratelimit import V2RateLimit
+
+if TYPE_CHECKING:
+    from ...ir import IR
 
 
 # #############################################################################
@@ -39,17 +42,20 @@ class V2Config (EnvoyConfig):
     ratelimit: Optional[V2RateLimit]
     bootstrap: V2Bootstrap
     routes: List[V2Route]
-    listeners: List[V2Listener]
+    listeners: List[Union[V2Listener,V2TCPListener]]
     clusters: List[V2Cluster]
     static_resources: V2StaticResources
-    sni_routes: List[Dict[str, Any]]
 
-    def __init__(self, ir: IR) -> None:
+    def __init__(self, ir: 'IR', cache: Optional[Cache]=None) -> None:
+        # Init our superclass...
         super().__init__(ir)
+
+        # ...then make sure we have a cache (which might be a NullCache).
+        self.cache = cache or NullCache(self.ir.logger)
+
         V2Admin.generate(self)
         V2Tracing.generate(self)
 
-        self.sni_routes = []
         V2RateLimit.generate(self)
         V2Route.generate(self)
         V2Listener.generate(self)
@@ -58,9 +64,11 @@ class V2Config (EnvoyConfig):
         V2Bootstrap.generate(self)
 
     def as_dict(self) -> Dict[str, Any]:
+        bootstrap_config, ads_config = self.split_config()
+
         d = {
-            'bootstrap': self.bootstrap,
-            'static_resources': self.static_resources
+            'bootstrap': bootstrap_config,
+            **ads_config
         }
 
         return d
@@ -68,7 +76,31 @@ class V2Config (EnvoyConfig):
     def split_config(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         ads_config = {
             '@type': '/envoy.config.bootstrap.v2.Bootstrap',
-            'static_resources': self.static_resources
+            'static_resources': self.static_resources,
+            'layered_runtime': {
+                'layers': [
+                    {
+                        'name': 'static_layer',
+                        'static_layer': {
+                            # For now, we enable the deprecated & disallowed_by_default "HTTP_JSON_V1" Zipkin
+                            # collector_endpoint_version because it repesents the Zipkin v1 API, while the
+                            # non-deprecated options HTTP_JSON and HTTP_PROTO are the Zipkin v2 API; switching
+                            # top one of them would change how Envoy talks to the outside world.
+                            'envoy.deprecated_features:envoy.config.trace.v2.ZipkinConfig.HTTP_JSON_V1': True,
+                            # Give our users more time to migrate to v2; we've said that we'll continue
+                            # supporting both for a while even after we change the default.
+                            'envoy.deprecated_features:envoy.config.filter.http.ext_authz.v2.ExtAuthz.use_alpha': True,
+                            # We haven't yet told users that we'll be deprecating `regex_type: unsafe`.
+                            'envoy.deprecated_features:envoy.api.v2.route.RouteMatch.regex': True,         # HTTP path
+                            'envoy.deprecated_features:envoy.api.v2.route.HeaderMatcher.regex_match': True, # HTTP header
+                            # Envoy 1.14.1 disabled the use of lowercase string matcher for headers matching in HTTP-based.
+                            # Following setting toggled it to be consistent with old behavior.
+                            # AuthenticationTest (v0) is a good example that expects the old behavior. 
+                            'envoy.reloadable_features.ext_authz_http_service_enable_case_sensitive_string_matcher': False
+                        }
+                    }
+                ]
+            }
         }
 
         bootstrap_config = dict(self.bootstrap)

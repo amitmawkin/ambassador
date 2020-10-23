@@ -15,7 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/gogo/protobuf/types"
+	"github.com/golang/protobuf/ptypes"
 )
 
 // ensure the imports are used
@@ -30,8 +30,11 @@ var (
 	_ = time.Duration(0)
 	_ = (*url.URL)(nil)
 	_ = (*mail.Address)(nil)
-	_ = types.DynamicAny{}
+	_ = ptypes.DynamicAny{}
 )
+
+// define the regex for a UUID once up-front
+var _transcoder_uuidPattern = regexp.MustCompile("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 // Validate checks the field values on GrpcJsonTranscoder with the rules
 // defined in the proto definition for this message. If any rules are
@@ -48,17 +51,12 @@ func (m *GrpcJsonTranscoder) Validate() error {
 		}
 	}
 
-	{
-		tmp := m.GetPrintOptions()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return GrpcJsonTranscoderValidationError{
-					field:  "PrintOptions",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetPrintOptions()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return GrpcJsonTranscoderValidationError{
+				field:  "PrintOptions",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
@@ -68,6 +66,8 @@ func (m *GrpcJsonTranscoder) Validate() error {
 	// no validation rules for AutoMapping
 
 	// no validation rules for IgnoreUnknownQueryParameters
+
+	// no validation rules for ConvertGrpcStatus
 
 	switch m.DescriptorSet.(type) {
 

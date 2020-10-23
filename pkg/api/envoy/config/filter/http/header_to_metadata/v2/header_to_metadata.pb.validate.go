@@ -15,7 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/gogo/protobuf/types"
+	"github.com/golang/protobuf/ptypes"
 )
 
 // ensure the imports are used
@@ -30,8 +30,11 @@ var (
 	_ = time.Duration(0)
 	_ = (*url.URL)(nil)
 	_ = (*mail.Address)(nil)
-	_ = types.DynamicAny{}
+	_ = ptypes.DynamicAny{}
 )
+
+// define the regex for a UUID once up-front
+var _header_to_metadata_uuidPattern = regexp.MustCompile("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 // Validate checks the field values on Config with the rules defined in the
 // proto definition for this message. If any rules are violated, an error is returned.
@@ -43,17 +46,12 @@ func (m *Config) Validate() error {
 	for idx, item := range m.GetRequestRules() {
 		_, _ = idx, item
 
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return ConfigValidationError{
-						field:  fmt.Sprintf("RequestRules[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return ConfigValidationError{
+					field:  fmt.Sprintf("RequestRules[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
@@ -63,17 +61,12 @@ func (m *Config) Validate() error {
 	for idx, item := range m.GetResponseRules() {
 		_, _ = idx, item
 
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return ConfigValidationError{
-						field:  fmt.Sprintf("ResponseRules[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return ConfigValidationError{
+					field:  fmt.Sprintf("ResponseRules[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
@@ -234,32 +227,29 @@ func (m *Config_Rule) Validate() error {
 		}
 	}
 
-	{
-		tmp := m.GetOnHeaderPresent()
+	if !_Config_Rule_Header_Pattern.MatchString(m.GetHeader()) {
+		return Config_RuleValidationError{
+			field:  "Header",
+			reason: "value does not match regex pattern \"^[^\\x00\\n\\r]*$\"",
+		}
+	}
 
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return Config_RuleValidationError{
-					field:  "OnHeaderPresent",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetOnHeaderPresent()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return Config_RuleValidationError{
+				field:  "OnHeaderPresent",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
 
-	{
-		tmp := m.GetOnHeaderMissing()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return Config_RuleValidationError{
-					field:  "OnHeaderMissing",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetOnHeaderMissing()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return Config_RuleValidationError{
+				field:  "OnHeaderMissing",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
@@ -322,3 +312,5 @@ var _ interface {
 	Cause() error
 	ErrorName() string
 } = Config_RuleValidationError{}
+
+var _Config_Rule_Header_Pattern = regexp.MustCompile("^[^\x00\n\r]*$")

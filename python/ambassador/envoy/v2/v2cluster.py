@@ -15,6 +15,7 @@
 import urllib
 from typing import Dict, List, Union, TYPE_CHECKING
 
+from ...cache import Cacheable
 from ...ir.ircluster import IRCluster
 
 from .v2tls import V2TLSContext
@@ -23,10 +24,10 @@ if TYPE_CHECKING:
     from . import V2Config
 
 
-class V2Cluster(dict):
+class V2Cluster(Cacheable):
     def __init__(self, config: 'V2Config', cluster: IRCluster) -> None:
         super().__init__()
-        
+
         dns_lookup_family = 'V4_ONLY'
 
         if cluster.enable_ipv6:
@@ -35,13 +36,23 @@ class V2Cluster(dict):
             else:
                 dns_lookup_family = 'V6_ONLY'
 
+        # We must not use cluster.name in the envoy config, since it may be too long
+        # to pass envoy's cluster name length constraint, currently 60 characters.
+        #
+        # Instead, we must have generated an appropriate envoy_name during IR finalize.
+        # In practice, the envoy_name is a short-form of cluster.name with the first
+        # 40 characters followed by `-n` where `n` is an incremental value, one for
+        # every cluster whose name contains the same first 40 characters.
+        assert(cluster.envoy_name)
+        assert(len(cluster.envoy_name) <= 60)
+
         fields = {
-            'name': cluster.name,
+            'name': cluster.envoy_name,
             'type': cluster.type.upper(),
             'lb_policy': cluster.lb_type.upper(),
             'connect_timeout':"%0.3fs" % (float(cluster.connect_timeout_ms) / 1000.0),
             'load_assignment': {
-                'cluster_name': cluster.name,
+                'cluster_name': cluster.envoy_name,
                 'endpoints': [
                     {
                         'lb_endpoints': self.get_endpoints(cluster)
@@ -71,16 +82,28 @@ class V2Cluster(dict):
 
         if ctx is not None:
             # If this is a null TLS Context (_ambassador_enabled is True), then we at need to specify a
-            # minimal `tls_context` to enable HTTPS origination.
+            # minimal `tls_context` to enable HTTPS origination. This means that we type envoy_ctx just
+            # as a plain ol' dict, because it's a royal pain to try to use a V2TLSContext (which is a
+            # subclass of dict anyway) for this degenerate case.
+            #
+            # XXX That's a silly reason to not do proper typing.
+            envoy_ctx: dict
 
             if ctx.get('_ambassador_enabled', False):
-                fields['tls_context'] = {
+                envoy_ctx = {
                     'common_tls_context': {}
                 }
             else:
                 envoy_ctx = V2TLSContext(ctx=ctx, host_rewrite=cluster.get('host_rewrite', None))
-                if envoy_ctx:
-                    fields['tls_context'] = envoy_ctx
+
+            if envoy_ctx:
+                fields['transport_socket'] = {
+                    'name': 'envoy.transport_sockets.tls',
+                    'typed_config': {
+                        '@type': 'type.googleapis.com/envoy.api.v2.auth.UpstreamTlsContext',
+                        **envoy_ctx
+                    }
+                }
 
 
         keepalive = cluster.get('keepalive', None)
@@ -111,11 +134,12 @@ class V2Cluster(dict):
 
         targetlist = cluster.get('targets', [])
 
-        if cluster.enable_endpoints and len(targetlist) > 0:
+        if len(targetlist) > 0:
             for target in targetlist:
                 address = {
                     'address': target['ip'],
-                    'port_value': target['port']
+                    'port_value': target['port'],
+                    'protocol': 'TCP'  # Yes, really. Envoy uses the TLS context to determine whether to originate TLS.
                 }
                 result.append({'endpoint': {'address': {'socket_address': address}}})
         else:
@@ -158,8 +182,34 @@ class V2Cluster(dict):
 
     @classmethod
     def generate(self, config: 'V2Config') -> None:
+        cluster: 'V2Cluster'
+
         config.clusters = []
 
-        for ircluster in sorted(config.ir.clusters.values(), key=lambda x: x.name):
-            cluster = config.save_element('cluster', ircluster, V2Cluster(config, ircluster))
+        # Sort by the envoy cluster name (x.envoy_name), not the symbolic IR cluster name (x.name)
+        for ircluster in sorted(config.ir.clusters.values(), key=lambda x: x.envoy_name):
+            cache_key = f"V2-{ircluster.cache_key}"
+            cached_cluster = config.cache[cache_key]
+
+            if cached_cluster is None:
+                # Cache miss.
+                cluster = config.save_element('cluster', ircluster, V2Cluster(config, ircluster))
+
+                # Cheat a bit and force the route's cache key.
+                cluster.cache_key = cache_key
+
+                # Not all IRClusters are cached yet -- e.g. AuthService and RateLimitService
+                # don't participate in the cache yet. Don't try to cache this V2Cluster if
+                # we won't be able to link it correctly.
+                cached_ircluster = config.cache[ircluster.cache_key]
+
+                if cached_ircluster is not None:
+                    config.cache.add(cluster)
+                    config.cache.link(ircluster, cluster)
+            else:
+                # Cache hit. We know a priori that it's a V2Cluster, but let's assert
+                # that rather than casting.
+                assert(isinstance(cached_cluster, V2Cluster))
+                cluster = cached_cluster
+
             config.clusters.append(cluster)

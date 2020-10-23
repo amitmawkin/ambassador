@@ -1,56 +1,302 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 shopt -s expand_aliases
 
 alias echo_on="{ set -x; }"
 alias echo_off="{ set +x; } 2>/dev/null"
 
-RED='\033[1;31m'
-GRN='\033[1;32m'
-YEL='\033[1;33m'
-BLU='\033[1;34m'
-WHT='\033[1;37m'
-END='\033[0m'
+# Choose colors carefully. If they don't work on both a black
+# background and a white background, pick other colors (so white,
+# yellow, and black are poor choices).
+RED=$'\033[1;31m'
+GRN=$'\033[1;32m'
+BLU=$'\033[1;34m'
+CYN=$'\033[1;36m'
+END=$'\033[0m'
 
 set -e
 
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do # resolve $SOURCE until the file is no longer a symlink
-  DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
-  SOURCE="$(readlink "$SOURCE")"
-  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE" # if $SOURCE was a relative symlink, we need to resolve it relative to the path where the symlink file was located
+    DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE" # if $SOURCE was a relative symlink, we need to resolve it relative to the path where the symlink file was located
 done
 DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
 DBUILD=${DIR}/dbuild.sh
 
-builder() { docker ps -q -f label=builder; }
+now=$(date +"%H%M%S")
+
+# container name of the builder
+BUILDER_CONT_NAME=${BUILDER_CONT_NAME:-"bld-${BUILDER_NAME}-${now}"}
+
+# command for running a container (ie, "docker run")
+BUILDER_DOCKER_RUN=${BUILDER_DOCKER_RUN:-docker run}
+
+# the name of the Docker network
+# note: this is necessary for connecting the builder to a local k3d/microk8s/kind network (ie, for running tests)
+BUILDER_DOCKER_NETWORK=${BUILDER_DOCKER_NETWORK:-${BUILDER_NAME}}
+
+# Do this with `eval` so that we properly interpret quotes.
+eval "pytest_args=(${PYTEST_ARGS:-})"
+
+msg() {
+    printf "${CYN}==> ${GRN}%s${END}\n" "$*" >&2
+}
+
+msg2() {
+    printf "${BLU}  -> ${GRN}%s${END}\n" "$*" >&2
+}
+
+panic() {
+    printf 'panic: %s\n' "$*" >&2
+    exit 1
+}
+
+builder() {
+    docker ps --quiet \
+           --filter=label=builder \
+           --filter=label="$BUILDER_NAME"
+}
+builder_network() { docker network ls -q -f name="${BUILDER_DOCKER_NETWORK}"; }
 
 builder_volume() { docker volume ls -q -f label=builder; }
+
+declare -a dsynced
+
+dsync() {
+    msg2 "Synchronizing... $*"
+    TIMEFORMAT="     (sync took %1R seconds)"
+    time IFS='|' read -ra dsynced <<<"$(rsync --info=name -aO --blocking-io -e 'docker exec -i' $@ 2> >(fgrep -v 'rsync: failed to set permissions on' >&2) | tr '\n' '|')"
+}
+
+dcopy() {
+    msg2 "Copying... $*"
+    local TIMEFORMAT="     (copy took %1R seconds)"
+    time docker cp $@
+}
+
+dexec() {
+    if [[ -t 0 ]]; then
+        flags=-it
+    else
+        flags=-i
+    fi
+    docker exec ${flags} $(builder) "$@"
+}
+
+# Usage: build_builder_base [--stage1-only]
+# Effects:
+#   1. Set the `builder_base_image` variable in the parent scope
+#   2. Ensure that the `$builder_base_image` Docker image exists (pulling
+#      it or building it if it doesn't).
+#   3. (If $DEV_REGISTRY is set AND we built the image) push the
+#      `$builder_base_image` Docker image.
+#
+# Description:
+#
+#   Rebuild (and push if DEV_REGISTRY is set) the builder's base image if
+#    - `Dockerfile.base` changes
+#    - `requirements.txt` changes
+#    - Enough time has passed (The base only has external/third-party
+#      dependencies, and most of those dependencies are not pinned by
+#      version, so we rebuild periodically to make sure we don't fall too
+#      far behind and then get surprised when a rebuild is required for
+#      Dockerfile changes.)  We have defined "enough time" as a few days.
+#      See the variable "build_every_n_days" below.
+#
+#   The base theory of operation is that we generate a Docker tag name that
+#   is essentially the tuple
+#     (rounded_timestamp, hash(Dockerfile.base), hash(requirements.txt)
+#   then check that tag for existence/pullability using `docker run --rm
+#   --entrypoint=true`; and build it if it doesn't exist and can't be
+#   pulled.
+#
+#   OK, now for a wee bit of complexity.  We want to use `pip-compile` to
+#   update `requirements.txt`.  Because of Python-version-conditioned
+#   dependencies, we really want to run it with the image's python3, not
+#   with the host's python3.  And since we're updating `requirements.txt`,
+#   we don't really want the `pip install` to have already been run.  So,
+#   we split the base image in to two stages; stage-1 is everything but
+#   `COPY requirements.txt` / `pip install -r requirements.txt`, and then
+#   stage-2 copies in `requirements.txt` and runs the `pip install`.  In
+#   normal operation we just go ahead and build both stages.  But if the
+#   `--stage1-only` flag is given (as it is by the `pip-compile`
+#   subcommand), then we only build the stage-1, and set the
+#   `builder_base_image` variable to that.
+build_builder_base() {
+    local builder_base_tag_py='
+# Someone please rewrite this in portable Bash. Until then, this code
+# works on Python 2.7 and 3.5+.
+
+import datetime, hashlib
+
+build_every_n_days = 5  # Periodic rebuild even if Dockerfile does not change
+epoch = datetime.datetime(2017, 4, 13, 1, 30)
+age = int((datetime.datetime.now() - epoch).days / build_every_n_days)
+age_start = epoch + datetime.timedelta(days=age*build_every_n_days)
+
+dockerfilehash = hashlib.sha256(open("Dockerfile.base", "rb").read()).hexdigest()
+stage1 = "%sx%s-%s" % (age_start.strftime("%Y%m%d"), build_every_n_days, dockerfilehash[:16])
+
+requirementshash = hashlib.sha256(open("requirements.txt", "rb").read()).hexdigest()
+stage2 = "%s-%s" % (stage1, requirementshash[:16])
+
+print("stage1_tag=%s" % stage1)
+print("stage2_tag=%s" % stage2)
+'
+
+    local stage1_tag stage2_tag
+    eval "$(cd "$DIR" && python -c "$builder_base_tag_py")" # sets 'stage1_tag' and 'stage2_tag'
+
+    local BASE_REGISTRY="${BASE_REGISTRY:-${DEV_REGISTRY:-${BUILDER_NAME}.local}}"
+
+    local name1="${BASE_REGISTRY}/builder-base:stage1-${stage1_tag}"
+    local name2="${BASE_REGISTRY}/builder-base:stage2-${stage2_tag}"
+
+    msg2 "Using stage-1 base ${BLU}${name1}${GRN}"
+    if ! docker run --rm --entrypoint=true "$name1"; then # skip building if the "$name1" already exists
+        ${DBUILD} -f "${DIR}/Dockerfile.base" -t "${name1}" --target builderbase-stage1 "${DIR}"
+        if [[ "$BASE_REGISTRY" == "$DEV_REGISTRY" ]]; then
+            docker push "$name1"
+        fi
+    fi
+    if [[ $1 = '--stage1-only' ]]; then
+        builder_base_image="$name1" # not local
+        return
+    fi
+
+    msg2 "Using stage-2 base ${BLU}${name2}${GRN}"
+    if ! docker run --rm --entrypoint=true "$name2"; then # skip building if the "$name2" already exists
+        ${DBUILD} --build-arg=builderbase_stage1="$name1" -f "${DIR}/Dockerfile.base" -t "${name2}" --target builderbase-stage2 "${DIR}"
+        if [[ "$BASE_REGISTRY" == "$DEV_REGISTRY" ]]; then
+            docker push "$name2"
+        fi
+    fi
+
+    builder_base_image="$name2" # not local
+}
 
 bootstrap() {
     if [ -z "$(builder_volume)" ] ; then
         docker volume create --label builder
-        printf "${GRN}Created docker volume ${BLU}$(builder_volume)${GRN} for caching${END}\n"
+        msg2 "Created docker volume ${BLU}$(builder_volume)${GRN} for caching"
+    fi
+
+    if [ -z "$(builder_network)" ]; then
+        msg2 "Creating docker network ${BLU}${BUILDER_DOCKER_NETWORK}${GRN}"
+        docker network create "${BUILDER_DOCKER_NETWORK}" > /dev/null
+    else
+        msg2 "Connecting to existing network ${BLU}${BUILDER_DOCKER_NETWORK}${GRN}"
     fi
 
     if [ -z "$(builder)" ] ; then
-        printf "${WHT}==${GRN}Bootstrapping build image${WHT}==${END}\n"
-        ${DBUILD} --build-arg envoy=$(cat ${DIR}/../base-envoy.docker) --target builder ${DIR} -t builder
+        if ! [ -e docker/builder-base.docker ]; then
+            panic "This should not happen"
+        fi
+        builder_base_image=$(cat docker/builder-base.docker)
+        msg2 'Bootstrapping build image'
+        ${DBUILD} \
+            --build-arg=envoy="${ENVOY_DOCKER_TAG}" \
+            --build-arg=builderbase="${builder_base_image}" \
+            --target=builder \
+            ${DIR} -t ${BUILDER_NAME}.local/builder
         if [ "$(uname -s)" == Darwin ]; then
             DOCKER_GID=$(stat -f "%g" /var/run/docker.sock)
         else
             DOCKER_GID=$(stat -c "%g" /var/run/docker.sock)
         fi
         if [ -z "${DOCKER_GID}" ]; then
-            echo "Unable to determine docker group-id"
-            exit 1
+            panic "Unable to determine docker group-id"
         fi
-        docker run --group-add ${DOCKER_GID} -d --rm -v /var/run/docker.sock:/var/run/docker.sock -v $(builder_volume):/home/dw --net=host --cap-add NET_ADMIN -lbuilder --entrypoint tail builder -f /dev/null > /dev/null
-        printf "${GRN}Started build container ${BLU}$(builder)${END}\n"
+
+        msg2 'Starting build container...'
+
+        echo_on
+        $BUILDER_DOCKER_RUN \
+            --name="$BUILDER_CONT_NAME" \
+            --network="${BUILDER_DOCKER_NETWORK}" \
+            --network-alias="builder" \
+            --group-add="${DOCKER_GID}" \
+            --detach \
+            --rm \
+            --volume=/var/run/docker.sock:/var/run/docker.sock \
+            --volume="$(builder_volume):/home/dw" \
+            ${BUILDER_MOUNTS} \
+            --cap-add=NET_ADMIN \
+            --label=builder \
+            --label="${BUILDER_NAME}" \
+            --label="${BUILDER_NAME}" \
+            ${BUILDER_PORTMAPS} \
+            ${BUILDER_DOCKER_EXTRA} \
+            --env=BUILDER_NAME="${BUILDER_NAME}" \
+            --entrypoint=tail ${BUILDER_NAME}.local/builder -f /dev/null > /dev/null
+        echo_off
+
+        msg2 "Started build container ${BLU}$(builder)${GRN}"
     fi
 
-    rsync -q -a -e 'docker exec -i' ${DIR}/builder.sh $(builder):/buildroot
+    dcopy ${DIR}/builder.sh $(builder):/buildroot
+    dcopy ${DIR}/builder_bash_rc $(builder):/home/dw/.bashrc
+}
+
+module_version() {
+    echo MODULE="\"$1\""
+
+    echo GIT_BRANCH="\"$(git rev-parse --abbrev-ref HEAD)\""
+
+    # The short git commit hash
+    echo GIT_COMMIT="\"$(git rev-parse --short HEAD)\""
+    # Whether `git add . && git commit` would commit anything (empty=false, nonempty=true)
+    if [ -n "$(git status --porcelain)" ]; then
+        echo GIT_DIRTY="\"dirty\""
+        dirty="yes"
+    else
+        echo GIT_DIRTY="\"\""
+        dirty=""
+    fi
+    # The _previous_ tag, plus a git delta, like 0.36.0-436-g8b8c5d3
+    echo GIT_DESCRIPTION="\"$(git describe --tags)\""
+
+    # We're going to post-process RELEASE_VERSION below.  But for now
+    # what you need to know is: This block is just going to set it to
+    # the git tag.
+    #
+    # The reason that we give precedence to `CIRCLE_TAG` over `git
+    # describe` is that if there are multiple tags pointing at the
+    # same commit, then it is non-deterministic which tag `git
+    # describe` will choose.  We want to know which one of those tags
+    # actually triggered this CI run, so we give precedence to
+    # CircleCI, since it has information that isn't actually stored in
+    # Git.
+    for VAR in "${CIRCLE_TAG}" "$(git describe --tags --always)"; do
+        if [ -n "${VAR}" ]; then
+            RELEASE_VERSION="${VAR}"
+            break
+        fi
+    done
+
+    # RELEASE_VERSION is an X.Y.Z[-prerelease] (semver) string that we
+    # will upload/release the image as.  It does NOT include a leading 'v'
+    # (trimming the 'v' from the git tag is what the 'patsubst' is for).
+    # If this is an RC or EA, then it includes the '-rc.N' or '-ea.N'
+    # suffix.
+    #
+    # BUILD_VERSION is of the same format, but is the version number that
+    # we build into the image.  Because an image built as a "release
+    # candidate" will ideally get promoted to be the GA image, we trim off
+    # the '-rc.N' suffix.
+    if [[ ${RELEASE_VERSION} =~ ^v[0-9]+.*$ ]]; then
+        RELEASE_VERSION=${RELEASE_VERSION:1}
+    fi
+
+    if [ -n "${dirty}" ]; then
+        RELEASE_VERSION="${RELEASE_VERSION}-dirty"
+    fi
+
+    echo RELEASE_VERSION="\"${RELEASE_VERSION}\""
+    echo BUILD_VERSION="\"$(echo "${RELEASE_VERSION}" | sed 's/-rc\.[0-9]*$//')\""
 }
 
 sync() {
@@ -60,40 +306,46 @@ sync() {
 
     real=$(cd ${sourcedir}; pwd)
 
-    docker exec -i ${container} mkdir -p /buildroot/${name}
-    summarize-sync $name $container $(rsync --exclude-from=${DIR}/sync-excludes.txt --info=name -a --delete -e 'docker exec -i' ${real}/ ${container}:/buildroot/${name})
-}
-
-dirty() {
-    cid=$1
-    docker exec -i ${cid} sh -c 'test -n "$(ls /buildroot | fgrep .dirty)"'
-}
-
-clear-dirty() {
-    cid=$1
-    docker exec -i ${cid} sh -c 'rm -f /buildroot/*.dirty'
+    dexec mkdir -p /buildroot/${name}
+    if [[ $name == apro ]]; then
+        # Don't let 'deleting ambassador' cause the sync to be marked dirty
+        dexec sh -c 'rm -rf apro/ambassador'
+    fi
+    dsync $DSYNC_EXTRA --exclude-from=${DIR}/sync-excludes.txt --delete ${real}/ ${container}:/buildroot/${name}
+    summarize-sync $name "${dsynced[@]}"
+    if [[ $name == apro ]]; then
+        # BusyBox `ln` 1.30.1's `-T` flag is broken, and doesn't have a `-t` flag.
+        dexec sh -c 'if ! test -L apro/ambassador; then rm -rf apro/ambassador && ln -s ../ambassador apro; fi'
+    fi
+    (cd ${sourcedir} && module_version ${name} ) | dexec sh -c "cat > /buildroot/${name}.version && cp ${name}.version ambassador/python/"
 }
 
 summarize-sync() {
     name=$1
     shift
-    container=$1
-    shift
-    if [ "$#" != 0 ]; then
-        docker exec -i ${container} touch /buildroot/${name}.dirty
+    lines=("$@")
+    if [ "${#lines[@]}" != 0 ]; then
+        dexec touch ${name}.dirty image.dirty
     fi
-    printf "${GRN}Synced $# ${BLU}${name}${GRN} source files${END}\n"
-    prevdel=""
-    for var in "$@"; do
-        if [ -n "$prevdel" ]; then
-            printf "  ${YEL}deleted${END} $var\n"
-        fi
-        if [ "${var}" == "deleting" ]; then
-            prevdel="x"
-        else
-            prevdel=""
+    for line in "${lines[@]}"; do
+        if [[ $line = *.go ]]; then
+            dexec touch go.dirty
+            break
         fi
     done
+    printf "     ${GRN}Synced ${#lines[@]} ${BLU}${name}${GRN} source files${END}\n"
+    PARTIAL="yes"
+    for i in {0..9}; do
+        if [ "$i" = "${#lines[@]}" ]; then
+            PARTIAL=""
+            break
+        fi
+        line="${lines[$i]}"
+        printf "       ${CYN}%s${END}\n" "$line"
+    done
+    if [ -n "${PARTIAL}" ]; then
+        printf "       ${CYN}...${END}\n"
+    fi
 }
 
 clean() {
@@ -103,106 +355,211 @@ clean() {
         docker kill ${cid} > /dev/null 2>&1
         docker wait ${cid} > /dev/null 2>&1 || true
     fi
+    nid=$(builder_network)
+    if [ -n "${nid}" ] ; then
+        printf "${GRN}Removing docker network ${BLU}${BUILDER_DOCKER_NETWORK} (${nid})${END}\n"
+        # This will fail if the network has some other endpoints alive: silence any errors
+        docker network rm ${nid} 2>&1 >/dev/null || true
+    fi
 }
 
-cmd="$1"
+find-modules () {
+    find /buildroot -type d -mindepth 1 -maxdepth 1 \! -name bin | sort
+}
+
+cmd="${1:-builder}"
 
 case "${cmd}" in
     clean)
         clean
         ;;
     clobber)
+        clean
         vid=$(builder_volume)
         if [ -n "${vid}" ] ; then
             printf "${GRN}Killing cache volume ${BLU}${vid}${END}\n"
-            docker volume rm ${vid} > /dev/null 2>&1
+            if ! docker volume rm ${vid} > /dev/null 2>&1 ; then \
+                printf "${RED}Could not kill cache volume; are other builders still running?${END}\n"
+            fi
         fi
         ;;
     bootstrap)
-        bootstrap
+        bootstrap >&2
         echo $(builder)
         ;;
-    builder|"")
+    builder)
         echo $(builder)
         ;;
     sync)
         shift
-        bootstrap
         sync $1 $2 $(builder)
+        ;;
+    release-type)
+        shift
+        RELVER="$1"
+        if [ -z "${RELVER}" ]; then
+            source <(module_version ${BUILDER_NAME})
+            RELVER="${RELEASE_VERSION}"
+        fi
+
+        if [[ "${RELVER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo release
+        elif [[ "${RELVER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]*$ ]]; then
+            echo rc
+        else
+            echo other
+        fi
+        ;;
+    release-version)
+        shift
+        source <(module_version ${BUILDER_NAME})
+        echo "${RELEASE_VERSION}"
+        ;;
+    version)
+        shift
+        source <(module_version ${BUILDER_NAME})
+        echo "${BUILD_VERSION}"
         ;;
     compile)
         shift
-        bootstrap
-        if [[ -t 0 ]]; then
-            docker exec -it $(builder) /buildroot/builder.sh compile-internal
-        else
-            docker exec $(builder) /buildroot/builder.sh compile-internal
-        fi
+        dexec /buildroot/builder.sh compile-internal
         ;;
     compile-internal)
         # This runs inside the builder image
-        for SRCDIR in $(find /buildroot -type f -name go.mod -or -name python -type d -mindepth 2 -maxdepth 2); do
-            module=$(basename $(dirname ${SRCDIR}))
+        if [[ $(find-modules) != /buildroot/ambassador* ]]; then
+            echo "Error: ambassador must be the first module to build things correctly"
+            echo "Modules are: $(find-modules)"
+            exit 1
+        fi
+
+        for MODDIR in $(find-modules); do
+            module=$(basename ${MODDIR})
+            eval "$(grep BUILD_VERSION apro.version 2>/dev/null)" # this will `eval ''` for OSS-only builds, leaving BUILD_VERSION unset; dont embed the version-number in OSS Go binaries
+
+            if [ -e ${module}.dirty ] || ([ "$module" != ambassador ] && [ -e go.dirty ]) ; then
+                if [ -e "${MODDIR}/go.mod" ]; then
+                    printf "${CYN}==> ${GRN}Building ${BLU}${module}${GRN} go code${END}\n"
+                    echo_on
+                    mkdir -p /buildroot/bin
+                    (cd ${MODDIR} && go build -trimpath ${BUILD_VERSION:+ -ldflags "-X main.Version=$BUILD_VERSION" } -o /buildroot/bin ./cmd/...) || exit 1
+                    if [ -e ${MODDIR}/post-compile.sh ]; then (cd ${MODDIR} && bash post-compile.sh); fi
+                    echo_off
+                fi
+            fi
+
             if [ -e ${module}.dirty ]; then
-                case ${SRCDIR} in
-                    */go.mod)
-                        printf "${WHT}==${GRN}Building ${BLU}${module}${GRN} go code${WHT}==${END}\n"
-                        wd=$(dirname ${SRCDIR})
+                if [ -e "${MODDIR}/python" ]; then
+                    if ! [ -e ${MODDIR}/python/*.egg-info ]; then
+                        printf "${CYN}==> ${GRN}Setting up ${BLU}${module}${GRN} python code${END}\n"
                         echo_on
-                        (cd ${wd} && GOBIN=/buildroot/bin go install ./cmd/...) || exit 1
+                        sudo pip install --no-deps -e ${MODDIR}/python || exit 1
                         echo_off
-                        ;;
-                    */python)
-                        if ! [ -e ${SRCDIR}/*.egg-info ]; then
-                            printf "${WHT}==${GRN}Setting up ${BLU}${module}${GRN} python code${WHT}==${END}\n"
-                            echo_on
-                            sudo pip install --no-deps -e ${SRCDIR} || exit 1
-                            echo_off
+                    fi
+                    chmod a+x ${MODDIR}/python/*.py
+                fi
+
+                rm ${module}.dirty
+            else
+                printf "${CYN}==> ${GRN}Already built ${BLU}${module}${GRN}${END}\n"
+            fi
+        done
+        rm -f go.dirty  # Do this after _all_ the Go code is built
+        ;;
+    mypy-internal)
+        # This runs inside the builder image
+        shift
+        op="$1"
+
+        # This runs inside the builder image
+        if [[ $(find-modules) != /buildroot/ambassador* ]]; then
+            echo "Error: ambassador must be the first module to build things correctly"
+            echo "Modules are: $(find-modules)"
+            exit 1
+        fi
+
+        for MODDIR in $(find-modules); do
+            module=$(basename ${MODDIR})
+
+            if [ -e "${MODDIR}/python" ]; then
+                cd "${MODDIR}"
+
+                case "$op" in
+                    start)
+                        if ! dmypy status >/dev/null; then
+                            dmypy start -- --use-fine-grained-cache --follow-imports=skip --ignore-missing-imports
+                            printf "${CYN}==> ${GRN}Started mypy server for ${BLU}$module${GRN} Python code${END}\n"
+                        else
+                            printf "${CYN}==> ${GRN}mypy server already running for ${BLU}$module${GRN} Python code${END}\n"
                         fi
-                        chmod a+x ${SRCDIR}/*.py
+                        ;;
+
+                    stop)
+                        printf "${CYN}==> ${GRN}Stopping mypy server for ${BLU}$module${GRN} Python code${END}"
+                        dmypy stop
+                        ;;
+
+                    check)
+                        printf "${CYN}==> ${GRN}Running mypy over ${BLU}$module${GRN} Python code${END}\n"
+                        time dmypy check python
                         ;;
                 esac
             fi
         done
         ;;
-    test-internal)
+
+    pip-compile)
+        build_builder_base --stage1-only
+        printf "${GRN}Running pip-compile to update ${BLU}requirements.txt${END}\n"
+        docker run --rm -i "$builder_base_image" sh -c 'tar xf - && pip-compile --allow-unsafe -q >&2 && cat requirements.txt' \
+               < <(cd "$DIR" && tar cf - requirements.in requirements.txt) \
+               > "$DIR/requirements.txt.tmp"
+        mv -f "$DIR/requirements.txt.tmp" "$DIR/requirements.txt"
+        ;;
+
+    pytest-internal)
         # This runs inside the builder image
         fail=""
-        for SRCDIR in $(find /buildroot -type f -name go.mod -mindepth 2 -maxdepth 2); do
-            module=$(basename $(dirname ${SRCDIR}))
-            wd=$(dirname ${SRCDIR})
-            pkgs=$(cd ${wd} && go list -f='{{ if or (gt (len .TestGoFiles) 0) (gt (len .XTestGoFiles) 0) }}{{ .ImportPath }}{{ end }}' ${GOTEST_PKGS})
-            if [ -n "${pkgs}" ]; then
-                if ! (cd ${wd} && go test ${pkgs} ${GOTEST_ARGS}) then
+        for MODDIR in $(find-modules); do
+            if [ -e "${MODDIR}/python" ]; then
+                if ! (cd ${MODDIR} && pytest --tb=short -ra "${pytest_args[@]}") then
                    fail="yes"
                 fi
             fi
         done
-        if [ "${fail}" == yes ]; then
+
+        if [ "${fail}" = yes ]; then
             exit 1
         fi
         ;;
-    commit)
-        shift
-        name=$1
-        if [ -z "${name}" ]; then
-            echo "usage: ./builder.sh commit <image-name>"
+    gotest-internal)
+        # This runs inside the builder image
+        fail=""
+        for MODDIR in $(find-modules); do
+            if [ -e "${MODDIR}/go.mod" ]; then
+                pkgs=$(cd ${MODDIR} && go list -f='{{ if or (gt (len .TestGoFiles) 0) (gt (len .XTestGoFiles) 0) }}{{ .ImportPath }}{{ end }}' ${GOTEST_PKGS})
+
+                if [ -n "${pkgs}" ]; then
+                    if ! (cd ${MODDIR} && go test ${pkgs} ${GOTEST_ARGS}) then
+                       fail="yes"
+                    fi
+                fi
+            fi
+        done
+
+        if [ "${fail}" = yes ]; then
             exit 1
         fi
-        cid=$(builder)
-        if dirty ${cid}; then
-	    printf "${WHT}==${GRN}Snapshotting ${BLU}builder${GRN} image${WHT}==${END}\n"
-	    docker rmi -f "${name}" &> /dev/null
-            docker commit -c 'ENTRYPOINT [ "/bin/bash" ]' ${cid} "${name}"
-        fi
-        clear-dirty ${cid}
+        ;;
+    build-builder-base)
+        build_builder_base >&2
+        echo "${builder_base_image}"
         ;;
     shell)
-        bootstrap
+        echo
         docker exec -it "$(builder)" /bin/bash
         ;;
     *)
-        echo "usage: builder.sh [bootstrap|builder|clean|clobber|compile|commit|shell]"
+        echo "usage: builder.sh [bootstrap|builder|clean|clobber|compile|build-builder-base|shell]"
         exit 1
         ;;
 esac

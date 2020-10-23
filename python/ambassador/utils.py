@@ -24,14 +24,17 @@ import threading
 import time
 import os
 import logging
+import re
 import requests
 import tempfile
 import yaml
 
 from .VERSION import Version
 from urllib.parse import urlparse
+from prometheus_client import Gauge
 
 if TYPE_CHECKING:
+    from .ir import IRResource
     from .ir.irtlscontext import IRTLSContext
     from .config.acresource import ACResource
 
@@ -58,13 +61,13 @@ yaml_logged_loader = False
 yaml_logged_dumper = False
 
 
-def parse_yaml(serialization: str, **kwargs) -> Any:
+def parse_yaml(serialization: str) -> Any:
     global yaml_logged_loader
 
     if not yaml_logged_loader:
         yaml_logged_loader = True
 
-        logger.info("YAML: using %s parser" % ("Python" if (yaml_loader == yaml.SafeLoader) else "C"))
+        # logger.info("YAML: using %s parser" % ("Python" if (yaml_loader == yaml.SafeLoader) else "C"))
 
     return list(yaml.load_all(serialization, Loader=yaml_loader))
 
@@ -75,7 +78,7 @@ def dump_yaml(obj: Any, **kwargs) -> str:
     if not yaml_logged_dumper:
         yaml_logged_dumper = True
 
-        logger.info("YAML: using %s dumper" % ("Python" if (yaml_dumper == yaml.SafeDumper) else "C"))
+        # logger.info("YAML: using %s dumper" % ("Python" if (yaml_dumper == yaml.SafeDumper) else "C"))
 
     return yaml.dump(obj, Dumper=yaml_dumper, **kwargs)
 
@@ -160,7 +163,7 @@ class RichStatus:
         return key in self.info
 
     def __str__(self):
-        attrs = ["%s=%s" % (key, self.info[key]) for key in sorted(self.info.keys())]
+        attrs = ["%s=%s" % (key, repr(self.info[key])) for key in sorted(self.info.keys())]
         astr = " ".join(attrs)
 
         if astr:
@@ -185,6 +188,219 @@ class RichStatus:
     def OK(self, **kwargs):
         return RichStatus(True, **kwargs)
 
+
+class Timer:
+    """
+    Timer is a simple class to measure time. When a Timer is created,
+    it is given a name, and is stopped.
+
+    t = Timer("test timer")
+
+    The simplest way to use the Timer is as a context manager:
+
+    with t:
+        something_to_be_timed()
+
+    You can also use the start method to start the timer:
+
+    t.start()
+
+    ...and the .stop method to stop the timer and update the timer's 
+    records.
+
+    t.stop()
+
+    Timers record the accumulated time and the number of start/stop
+    cycles (in .accumulated and .cycles respectively). They can also
+    return the average time per cycle (.average) and minimum and
+    maximum times per cycle (.minimum and .maximum).
+    """
+
+    name: str
+    _cycles: int
+    _starttime: float
+    _accumulated: float
+    _minimum: float
+    _maximum: float
+    _running: bool
+    _faketime: float
+    _gauge: Optional[Gauge]=None
+
+    def __init__(self, name: str, prom_metrics_registry: Optional[Any]=None) -> None:
+        """
+        Create a Timer, given a name. The Timer is initially stopped.
+        """
+
+        self.name = name
+
+        if prom_metrics_registry:
+            metric_prefix = re.sub('\s+', '_', name).lower()
+            self._gauge = Gauge(f'{metric_prefix}_time_seconds', f'Elapsed time on {name} operations',
+                                namespace='ambassador', registry=prom_metrics_registry)
+
+        self.reset()
+
+    def reset(self) -> None:
+        self._cycles = 0
+        self._starttime = 0
+        self._accumulated = 0.0
+        self._minimum = 999999999999
+        self._maximum = -999999999999
+        self._running = False
+        self._faketime = 0.0
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.stop()
+
+    def __bool__(self) -> bool:
+        """
+        Timers test True in a boolean context if they have timed at least one 
+        cycle.
+        """
+        return self._cycles > 0
+
+    def start(self, when: Optional[float]=None) -> None:
+        """
+        Start a Timer running.
+
+        :param when: Optional start time. If not supplied,
+        the current time is used.
+        """
+
+        # If we're already running, this method silently discards the 
+        # currently-running cycle. Why? Because otherwise, it's a little
+        # too easy to forget to stop a Timer, cause an Exception, and 
+        # crash the world.
+        #
+        # Not that I ever got bitten by this. Of course. [ :P ]
+
+        self._starttime = when or time.perf_counter()
+        self._running = True
+
+    def stop(self, when: Optional[float]=None) -> float:
+        """
+        Stop a Timer, increment the cycle count, and update the
+        accumulated time with the amount of time since the Timer
+        was started.
+
+        :param when: Optional stop time. If not supplied,
+        the current time is used.
+        :return: The amount of time the Timer has accumulated
+        """
+
+        # If we're already stopped, just return the same thing as the
+        # previous call to stop. See comments in start() for why this
+        # isn't an Exception...
+
+        if self._running:
+            if not when:
+                when = time.perf_counter()
+
+            self._running = False
+            self._cycles += 1
+
+            this_cycle = (when - self._starttime) + self._faketime
+            if self._gauge:
+                self._gauge.set(this_cycle)
+
+            self._faketime = 0
+
+            self._accumulated += this_cycle
+
+            if this_cycle < self._minimum:
+                self._minimum = this_cycle
+
+            if this_cycle > self._maximum:
+                self._maximum = this_cycle
+
+        return self._accumulated
+
+    def faketime(self, faketime: float) -> None:
+        """
+        Add fake time to a Timer. This is intended solely for
+        testing.
+        """
+
+        if not self._running:
+            raise Exception(f"Timer {self.name}.faketime: not running")
+
+        self._faketime = faketime
+
+    @property
+    def cycles(self):
+        """
+        The number of timing cycles this Timer has recorded.
+        """
+        return self._cycles
+    
+    @property
+    def starttime(self):
+        """
+        The time this Timer was last started, or 0 if it has
+        never been started.
+        """
+        return self._starttime
+    
+    @property
+    def accumulated(self):
+        """
+        The amount of time this Timer has accumulated.
+        """
+        return self._accumulated
+    
+    @property
+    def minimum(self):
+        """
+        The minimum single-cycle time this Timer has recorded.
+        """
+        return self._minimum
+    
+    @property
+    def maximum(self):
+        """
+        The maximum single-cycle time this Timer has recorded.
+        """
+        return self._maximum
+    
+    @property
+    def average(self):
+        """
+        The average cycle time for this Timer.
+        """
+        if self._cycles > 0:
+            return self._accumulated / self._cycles
+
+        raise Exception(f"Timer {self.name}.average: no cycles to average")
+
+    @property
+    def running(self):
+        """
+        Whether or not this Timer is running.
+        """
+        return self._running
+    
+    def __str__(self) -> str:
+        s = "Timer %s: " % self.name
+
+        if self._running:
+            s += "running, "
+
+        s += "%.6f sec" % self._accumulated
+
+        return s
+
+    def summary(self) -> str:
+        """
+        Return a summary of this Timer.
+        """
+
+        return "TIMER %s: %d, %.3f/%.3f/%.3f" % (
+                    self.name, self.cycles, self.minimum, self.average, self.maximum
+               )
 
 class DelayTrigger (threading.Thread):
     def __init__(self, onfired, timeout=5, name=None):
@@ -242,23 +458,56 @@ class PeriodicTrigger(threading.Thread):
 
 
 class SecretInfo:
-    def __init__(self, name: str, namespace: str,
-                 tls_crt: Optional[str], tls_key: Optional[str]=None, decode_b64=True) -> None:
+    """
+    SecretInfo encapsulates a secret, including its name, its namespace, and all of its
+    ciphertext elements. Pretty much everything in Ambassador that worries about secrets
+    uses a SecretInfo.
+    """
+    def __init__(self, name: str, namespace: str, secret_type: str,
+                 tls_crt: Optional[str]=None, tls_key: Optional[str]=None, user_key: Optional[str]=None,
+                 root_crt: Optional[str]=None, decode_b64=True) -> None:
         self.name = name
         self.namespace = namespace
+        self.secret_type = secret_type
 
         if decode_b64:
-            if tls_crt and not tls_crt.startswith('-----BEGIN'):
+            if self.is_decodable(tls_crt):
+                assert tls_crt
                 tls_crt = self.decode(tls_crt)
 
-            if tls_key and not tls_key.startswith('-----BEGIN'):
+            if self.is_decodable(tls_key):
+                assert tls_key
                 tls_key = self.decode(tls_key)
+
+            if self.is_decodable(user_key):
+                assert user_key
+                user_key = self.decode(user_key)
+
+            if self.is_decodable(root_crt):
+                assert root_crt
+                root_crt = self.decode(root_crt)
 
         self.tls_crt = tls_crt
         self.tls_key = tls_key
+        self.user_key = user_key
+        self.root_crt = root_crt
+
+    @staticmethod
+    def is_decodable(b64_pem: Optional[str]) -> bool:
+        if not b64_pem:
+            return False
+
+        return not (b64_pem.startswith('-----BEGIN') or
+                    b64_pem.startswith('-sanitized-'))
 
     @staticmethod
     def decode(b64_pem: str) -> Optional[str]:
+        """
+        Do base64 decoding of a cryptographic element.
+
+        :param b64_pem: Base64-encoded PEM element
+        :return: Decoded PEM element
+        """
         utf8_pem = None
         pem = None
 
@@ -276,6 +525,15 @@ class SecretInfo:
 
     @staticmethod
     def fingerprint(pem: Optional[str]) -> str:
+        """
+        Generate and return a cryptographic fingerprint of a PEM element.
+
+        The fingerprint is the uppercase hex SHA-1 signature of the element's UTF-8
+        representation.
+
+        :param pem: PEM element
+        :return: fingerprint string
+        """
         if not pem:
             return '<none>'
 
@@ -288,53 +546,125 @@ class SecretInfo:
         return f'{keytype}: {hd}'
 
     def to_dict(self) -> Dict[str, Any]:
+        """
+        Return the dictionary representation of this SecretInfo.
+
+        :return: dict
+        """
         return {
             'name': self.name,
             'namespace': self.namespace,
+            'secret_type': self.secret_type,
             'tls_crt': self.fingerprint(self.tls_crt),
-            'tls_key': self.fingerprint(self.tls_key)
+            'tls_key': self.fingerprint(self.tls_key),
+            'user_key': self.fingerprint(self.user_key),
+            'root_crt': self.fingerprint(self.root_crt)
         }
 
     @classmethod
     def from_aconf_secret(cls, aconf_object: 'ACResource') -> 'SecretInfo':
+        """
+        Convert an ACResource containing a secret into a SecretInfo. This is used by the IR.save_secret_info()
+        to convert saved secrets into SecretInfos.
+
+        :param aconf_object: a ACResource containing a secret
+        :return: SecretInfo
+        """
+
+        tls_crt = aconf_object.get('tls_crt', None)
+        if not tls_crt:
+            tls_crt = aconf_object.get('cert-chain_pem')
+
+        tls_key = aconf_object.get('tls_key', None)
+        if not tls_key:
+            tls_key = aconf_object.get('key_pem')
+
         return SecretInfo(
             aconf_object.name,
             aconf_object.namespace,
-            aconf_object.tls_crt,
-            aconf_object.get('tls_key', None)
+            aconf_object.secret_type,
+            tls_crt,
+            tls_key,
+            aconf_object.get('user_key', None),
+            aconf_object.get('root-cert_pem', None)
         )
 
     @classmethod
-    def from_dict(cls, context: 'IRTLSContext',
+    def from_dict(cls, resource: 'IRResource',
                   secret_name: str, namespace: str, source: str,
-                  cert_data: Optional[Dict[str, Any]]) -> Optional['SecretInfo']:
-        logger = context.ir.logger
+                  cert_data: Optional[Dict[str, Any]], secret_type="kubernetes.io/tls") -> Optional['SecretInfo']:
+        """
+        Given a secret's name and namespace, and a dictionary of configuration elements, return
+        a SecretInfo for the secret.
+
+        The "source" parameter needs some explanation. When working with secrets in most environments
+        where Ambassador runs, secrets will be loaded from some external system (e.g. Kubernetes),
+        and serialized to disk, and the disk serialization is the thing we can actually read the
+        dictionary of secret data from. The "source" parameter is the thing we read to get the actual
+        dictionary -- in our example above, "source" would be the pathname of the serialization on
+        disk, rather than the Kubernetes resource name.
+
+        :param resource: owning IRResource
+        :param secret_name: name of secret
+        :param namespace: namespace of secret
+        :param source: source of data
+        :param cert_data: dictionary of secret info (public and private key, etc.)
+        :param secret_type: Kubernetes-style secret type
+        :return:
+        """
+        tls_crt = None
+        tls_key = None
+        user_key = None
 
         if not cert_data:
-            logger.error("TLSContext %s: found no certificate in %s?" % (context.name, source))
+            resource.ir.logger.error(f"{resource.kind} {resource.name}: found no certificate in {source}?")
             return None
 
-        # OK, we have something to work with. Hopefully.
-        cert = cert_data.get('tls.crt', None)
+        if secret_type == 'kubernetes.io/tls':
+            # OK, we have something to work with. Hopefully.
+            tls_crt = cert_data.get('tls.crt', None)
 
-        if not cert:
-            # Having no public half is definitely an error. Having no private half given a public half
-            # might be OK, though -- that's up to our caller to decide.
-            logger.error("TLSContext %s: found data but no cert in %s?" % (context.name, source))
-            return None
+            if not tls_crt:
+                # Having no public half is definitely an error. Having no private half given a public half
+                # might be OK, though -- that's up to our caller to decide.
+                resource.ir.logger.error(f"{resource.kind} {resource.name}: found data but no certificate in {source}?")
+                return None
 
-        key = cert_data.get('tls.key', None)
+            tls_key = cert_data.get('tls.key', None)
+        elif secret_type == 'Opaque':
+            user_key = cert_data.get('user.key', None)
 
-        return SecretInfo(secret_name, namespace, cert, key)
+            if not user_key:
+                # The opaque keys we support must have user.key, but will likely have nothing else.
+                resource.ir.logger.error(f"{resource.kind} {resource.name}: found data but no user.key in {source}?")
+                return None
+
+            cert = None
+        elif secret_type == 'istio.io/key-and-cert':
+            resource.ir.logger.error(f"{resource.kind} {resource.name}: found data but handler for istio key not finished yet")
+
+        return SecretInfo(secret_name, namespace, secret_type, tls_crt=tls_crt, tls_key=tls_key, user_key=user_key)
 
 
 class SavedSecret:
+    """
+    SavedSecret collects information about a secret saved locally, including its name, namespace,
+    paths to its elements on disk, and a copy of its cert data dictionary.
+
+    It's legal for a SavedSecret to have paths, etc, of None, representing a secret for which we
+    found no information. SavedSecret will evaluate True as a boolean if - and only if - it has
+    the minimal information needed to represent a real secret.
+    """
     def __init__(self, secret_name: str, namespace: str,
-                 cert_path: Optional[str], key_path: Optional[str], cert_data: Optional[Dict]) -> None:
+                 cert_path: Optional[str], key_path: Optional[str],
+                 user_path: Optional[str], root_cert_path: Optional[str],
+                 cert_data: Optional[Dict]) -> None:
         self.secret_name = secret_name
         self.namespace = namespace
         self.cert_path = cert_path
         self.key_path = key_path
+        self.user_path = user_path
+        self.root_cert_path = root_cert_path
         self.cert_data = cert_data
 
     @property
@@ -342,16 +672,40 @@ class SavedSecret:
         return "secret %s in namespace %s" % (self.secret_name, self.namespace)
 
     def __bool__(self) -> bool:
-        return bool(bool(self.cert_path) and (self.cert_data is not None))
+        return bool((bool(self.cert_path) or bool(self.user_path)) and (self.cert_data is not None))
 
     def __str__(self) -> str:
-        return "<SavedSecret %s.%s -- cert_path %s, key_path %s, cert_data %s>" % (
-                  self.secret_name, self.namespace, self.cert_path, self.key_path,
+        return "<SavedSecret %s.%s -- cert_path %s, key_path %s, user_path %s, root_cert_path %s, cert_data %s>" % (
+                  self.secret_name, self.namespace, self.cert_path, self.key_path, self.user_path, self.root_cert_path,
                   "present" if self.cert_data else "absent"
                 )
 
 
 class SecretHandler:
+    """
+    SecretHandler: manage secrets for Ambassador. There are two fundamental rules at work here:
+
+    - The Python part of Ambassador doesn’t get to talk directly to Kubernetes. Part of this is
+      because the Python K8s client isn’t maintained all that well. Part is because, for testing,
+      we need to be able to separate secrets from Kubernetes.
+    - Most of the handling of secrets (e.g. saving the actual bits of the certs) need to be
+      common code paths, so that testing them outside of Kube gives results that are valid inside
+      Kube.
+
+    To work within these rules, you’re required to pass a SecretHandler when instantiating an IR.
+    The SecretHandler mediates access to secrets outside Ambassador, and to the cache of secrets
+    we've already loaded.
+
+    SecretHandler subclasses will typically only need to override load_secret: the other methods
+    of SecretHandler generally won't need to change, and arguably should not be considered part
+    of the public interface of SecretHandler.
+
+    Finally, note that SecretHandler itself is deliberately written to work correctly with
+    secrets as they're handed over from watt, which means that it can be instantiated directly
+    and handed to the IR when we're running "for real" in Kubernetes with watt. Other things
+    (like mockery and the watch_hook) use subclasses to manage specific needs that they have.
+    """
+
     logger: logging.Logger
     source_root: str
     cache_dir: str
@@ -362,34 +716,82 @@ class SecretHandler:
         self.cache_dir = cache_dir
         self.version = version
 
-    def load_secret(self, context: 'IRTLSContext',
-                    secret_name: str, namespace: str) -> Optional[SecretInfo]:
-        # This is the fallback load_secret implementation; it is expected that subclasses
-        # will override this.
-        #
-        # All this one does is return None, meaning that it couldn't find the requested
-        # secret (because, well, it doesn't really look).
-        self.logger.debug(
-            f"SecretHandler: Trying to load secret {secret_name} in namespace {namespace} from TLSContext {context}")
+    def load_secret(self, resource: 'IRResource', secret_name: str, namespace: str) -> Optional[SecretInfo]:
+        """
+        load_secret: given a secret’s name and namespace, pull it from wherever it really lives,
+        write it to disk, and return a SecretInfo telling the rest of Ambassador where it got written.
+
+        This is the fallback load_secret implementation, which doesn't do anything: it is written
+        assuming that ir.save_secret_info has already filled ir.saved_secrets with any secrets handed in
+        from watt, so that load_secrets will never be called for those secrets. Therefore, if load_secrets
+        gets called at all, it's for a secret that wasn't found, and it should just return None.
+
+        :param resource: referencing resource (so that we can correctly default the namespace)
+        :param secret_name: name of the secret
+        :param namespace: namespace, if any specific namespace was given
+        :return: Optional[SecretInfo]
+        """
+
+        self.logger.debug("SecretHandler (%s %s): load secret %s in namespace %s" %
+                          (resource.kind, resource.name, secret_name, namespace))
+
         return None
 
-    def cache_secret(self, context: 'IRTLSContext', secret_info: SecretInfo) -> SavedSecret:
+    def still_needed(self, resource: 'IRResource', secret_name: str, namespace: str) -> None:
+        """
+        still_needed: remember that a given secret is still needed, so that we can tell watt to
+        keep paying attention to it.
+
+        The default implementation doesn't do much of anything, because it assumes that we're
+        not running in the watch_hook, so watt has already been told everything it needs to be
+        told. This should be OK for everything that's not the watch_hook.
+
+        :param resource: referencing resource
+        :param secret_name: name of the secret
+        :param namespace: namespace of the secret
+        :return: None
+        """
+
+        self.logger.debug("SecretHandler (%s %s): secret %s in namespace %s is still needed" %
+                          (resource.kind, resource.name, secret_name, namespace))
+
+    def cache_secret(self, resource: 'IRResource', secret_info: SecretInfo) -> SavedSecret:
+        """
+        cache_secret: stash the SecretInfo from load_secret into Ambassador’s internal cache,
+        so that we don’t have to call load_secret again if we need it again.
+
+        The default implementation should be usable by everything that's not the watch_hook.
+
+        :param resource: referencing resource
+        :param secret_info: SecretInfo returned from load_secret
+        :return: SavedSecret
+        """
+
         name = secret_info.name
         namespace = secret_info.namespace
-        cert = secret_info.tls_crt
-        key = secret_info.tls_key
+        tls_crt = secret_info.tls_crt
+        tls_key = secret_info.tls_key
+        user_key = secret_info.user_key
+        root_crt = secret_info.root_crt
 
-        cert_path = None
-        key_path = None
-        cert_data = None
+        return self.cache_internal(name, namespace, tls_crt, tls_key, user_key, root_crt)
 
+    def cache_internal(self, name: str, namespace: str,
+                       tls_crt: Optional[str], tls_key: Optional[str],
+                       user_key: Optional[str], root_crt: Optional[str]) -> SavedSecret:
         h = hashlib.new('sha1')
 
-        if cert:
-            h.update(cert.encode('utf-8'))
+        tls_crt_path = None
+        tls_key_path = None
+        user_key_path = None
+        root_crt_path = None
+        cert_data = None
 
-            if key:
-                h.update(key.encode('utf-8'))
+        # Don't save if it has neither a tls_crt or a user_key or the root_crt
+        if tls_crt or user_key or root_crt:
+            for el in [tls_crt, tls_key, user_key]:
+                if el:
+                    h.update(el.encode('utf-8'))
 
             hd = h.hexdigest().upper()
 
@@ -400,25 +802,40 @@ class SecretHandler:
             except FileExistsError:
                 pass
 
-            cert_path = os.path.join(secret_dir, f'{hd}.crt')
-            open(cert_path, "w").write(cert)
+            if tls_crt:
+                tls_crt_path = os.path.join(secret_dir, f'{hd}.crt')
+                open(tls_crt_path, "w").write(tls_crt)
 
-            if key:
-                key_path = os.path.join(secret_dir, f'{hd}.key')
-                open(key_path, "w").write(key)
+            if tls_key:
+                tls_key_path = os.path.join(secret_dir, f'{hd}.key')
+                open(tls_key_path, "w").write(tls_key)
+
+            if user_key:
+                user_key_path = os.path.join(secret_dir, f'{hd}.user')
+                open(user_key_path, "w").write(user_key)
+
+            if root_crt:
+                root_crt_path = os.path.join(secret_dir, f'{hd}.root.crt')
+                open(root_crt_path, "w").write(root_crt)
 
             cert_data = {
-                'tls_crt': cert,
-                'tls_key': key
+                'tls_crt': tls_crt,
+                'tls_key': tls_key,
+                'user_key': user_key,
+                'root_crt': root_crt,
             }
 
-        return SavedSecret(name, namespace, cert_path, key_path, cert_data)
+            self.logger.debug(f"saved secret {name}.{namespace}: {tls_crt_path}, {tls_key_path}, {root_crt_path}")
 
-    # secret_info_from_k8s takes a K8s Secret and returns a SecretInfo (or None if something
-    # is wrong).
-    def secret_info_from_k8s(self, context: 'IRTLSContext',
+        return SavedSecret(name, namespace, tls_crt_path, tls_key_path, user_key_path, root_crt_path, cert_data)
+
+    def secret_info_from_k8s(self, resource: 'IRResource',
                              secret_name: str, namespace: str, source: str,
                              serialization: Optional[str]) -> Optional[SecretInfo]:
+        """
+        secret_info_from_k8s is NO LONGER USED.
+        """
+
         objects: Optional[List[Any]] = None
 
         self.logger.debug(f"getting secret info for secret {secret_name} from k8s")
@@ -429,13 +846,13 @@ class SecretHandler:
             try:
                 objects = parse_yaml(serialization)
             except yaml.error.YAMLError as e:
-                self.logger.error("TLSContext %s: could not parse %s: %s" %
-                                  (context.name, source, e))
+                self.logger.error(f"{resource.kind} {resource.name}: could not parse {source}: {e}")
 
         if not objects:
             # Nothing in the serialization, we're done.
             return None
 
+        secret_type = None
         cert_data = None
         ocount = 0
         errors = 0
@@ -445,23 +862,25 @@ class SecretHandler:
             kind = obj.get('kind', None)
 
             if kind != "Secret":
-                self.logger.error("TLSContext %s: found K8s %s at %s.%d?" %
-                                  (context.name, kind, source, ocount))
+                self.logger.error("%s %s: found K8s %s at %s.%d?" %
+                                  (resource.kind, resource.name, kind, source, ocount))
                 errors += 1
                 continue
 
             metadata = obj.get('metadata', None)
 
             if not metadata:
-                self.logger.error("TLSContext %s: found K8s Secret with no metadata at %s.%d?" %
-                                  (context.name, source, ocount))
+                self.logger.error("%s %s: found K8s Secret with no metadata at %s.%d?" %
+                                  (resource.kind, resource.name, source, ocount))
                 errors += 1
                 continue
 
+            secret_type = metadata.get('type', 'kubernetes.io/tls')
+
             if 'data' in obj:
                 if cert_data:
-                    self.logger.error("TLSContext %s: found multiple Secrets in %s?" %
-                                      (context.name, source))
+                    self.logger.error("%s %s: found multiple Secrets in %s?" %
+                                      (resource.kind, resource.name, source))
                     errors += 1
                     continue
 
@@ -471,7 +890,8 @@ class SecretHandler:
             # Bzzt.
             return None
 
-        return SecretInfo.from_dict(context, secret_name, source, namespace, cert_data)
+        return SecretInfo.from_dict(resource, secret_name, namespace, source,
+                                    cert_data=cert_data, secret_type=secret_type)
 
 
 class NullSecretHandler(SecretHandler):
@@ -493,16 +913,22 @@ class NullSecretHandler(SecretHandler):
 
         super().__init__(logger, source_root, cache_dir, version)
 
-    def load_secret(self, context: 'IRTLSContext', secret_name: str, namespace: str) -> Optional[SecretInfo]:
+    def load_secret(self, resource: 'IRResource', secret_name: str, namespace: str) -> Optional[SecretInfo]:
         # In the Real World, the secret loader should, y'know, load secrets..
         # Here we're just gonna fake it.
-        self.logger.debug(f"NullSecretHandler: Trying to load secret {secret_name} in namespace {namespace} from TLSContext {context}")
-        return SecretInfo(secret_name, namespace, "fake-tls-crt", "fake-tls-key")
+        self.logger.debug("NullSecretHandler (%s %s): load secret %s in namespace %s" %
+                          (resource.kind, resource.name, secret_name, namespace))
+
+        return SecretInfo(secret_name, namespace, "fake-secret", "fake-tls-crt", "fake-tls-key", "fake-user-key",
+                          decode_b64=False)
 
 
 class FSSecretHandler(SecretHandler):
-    def load_secret(self, context: 'IRTLSContext', secret_name: str, namespace: str) -> Optional[SecretInfo]:
-        self.logger.debug(f"FSSecretHandler: Trying to load secret {secret_name} in namespace {namespace} from TLSContext {context}")
+    # XXX NO LONGER USED
+    def load_secret(self, resource: 'IRResource', secret_name: str, namespace: str) -> Optional[SecretInfo]:
+        self.logger.debug("FSSecretHandler (%s %s): load secret %s in namespace %s" %
+                          (resource.kind, resource.name, secret_name, namespace))
+
         source = os.path.join(self.source_root, namespace, "secrets", "%s.yaml" % secret_name)
 
         serialization = None
@@ -510,7 +936,8 @@ class FSSecretHandler(SecretHandler):
         try:
             serialization = open(source, "r").read()
         except IOError as e:
-            self.logger.error("TLSContext %s: FSSecretHandler could not open %s" % (context.name, source))
+            self.logger.error("%s %s: FSSecretHandler could not open %s" %
+                              (resource.kind, resource.name, source))
 
         # Yes, this duplicates part of self.secret_info_from_k8s, but whatever.
         objects: Optional[List[Any]] = None
@@ -520,16 +947,16 @@ class FSSecretHandler(SecretHandler):
             try:
                 objects = parse_yaml(serialization)
             except yaml.error.YAMLError as e:
-                self.logger.error("TLSContext %s: could not parse %s: %s" %
-                                  (context.name, source, e))
+                self.logger.error("%s %s: could not parse %s: %s" %
+                                  (resource.kind, resource.name, source, e))
 
         if not objects:
             # Nothing in the serialization, we're done.
             return None
 
         if len(objects) != 1:
-            self.logger.error("TLSContext %s: found %d objects in %s instead of exactly 1" %
-                              (context.name, len(objects), source))
+            self.logger.error("%s %s: found %d objects in %s instead of exactly 1" %
+                              (resource.kind, resource.name, len(objects), source))
             return None
 
         obj = objects[0]
@@ -537,24 +964,29 @@ class FSSecretHandler(SecretHandler):
         version = obj.get('apiVersion', None)
         kind = obj.get('kind', None)
 
-        if version.startswith('ambassador') and (kind == 'Secret'):
+        if (kind == 'Secret') and (version.startswith('ambassador') or version.startswith('getambassador.io')):
             # It's an Ambassador Secret. It should have a public key and maybe a private key.
-            return SecretInfo.from_dict(context, secret_name, namespace, source, obj)
+            secret_type = obj.get('type', 'kubernetes.io/tls')
+            return SecretInfo.from_dict(resource, secret_name, namespace, source,
+                                        cert_data=obj, secret_type=secret_type)
 
         # Didn't look like an Ambassador object. Try K8s.
-        return self.secret_info_from_k8s(context, secret_name, namespace, source, serialization)
+        return self.secret_info_from_k8s(resource, secret_name, namespace, source, serialization)
 
 
 class KubewatchSecretHandler(SecretHandler):
-    def load_secret(self, context: 'IRTLSContext', secret_name: str, namespace: str) -> Optional[SecretInfo]:
-        self.logger.debug(f"KubewatchSecretHandler: Trying to load secret {secret_name} in namespace {namespace} from TLSContext {context}")
+    # XXX NO LONGER USED
+    def load_secret(self, resource: 'IRResource', secret_name: str, namespace: str) -> Optional[SecretInfo]:
+        self.logger.debug("FSSecretHandler (%s %s): load secret %s in namespace %s" %
+                          (resource.kind, resource.name, secret_name, namespace))
+
         source = "%s/secrets/%s/%s" % (self.source_root, namespace, secret_name)
         serialization = load_url_contents(self.logger, source)
 
         if not serialization:
-            self.logger.error("TLSContext %s: SCC.url_reader could not load %s" % (context.name, source))
+            self.logger.error("%s %s: SCC.url_reader could not load %s" % (resource.kind, resource.name, source))
 
-        return self.secret_info_from_k8s(context, secret_name, namespace, source, serialization)
+        return self.secret_info_from_k8s(resource, secret_name, namespace, source, serialization)
 
 # TODO(gsagula): This duplicates code from ircluster.py.
 class ParsedService:

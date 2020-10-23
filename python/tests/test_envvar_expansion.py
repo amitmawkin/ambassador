@@ -2,6 +2,9 @@ from typing import Optional
 
 import logging
 import os
+import sys
+
+import pytest
 
 logging.basicConfig(
     level=logging.INFO,
@@ -12,7 +15,7 @@ logging.basicConfig(
 logger = logging.getLogger("ambassador")
 
 from ambassador import Config, IR
-from ambassador.config import ResourceFetcher
+from ambassador.fetch import ResourceFetcher
 from ambassador.utils import NullSecretHandler
 from ambassador.ir import IRResource
 from ambassador.ir.irbuffer import IRBuffer
@@ -44,4 +47,4 @@ def test_envvar_expansion():
 
 
 if __name__ == '__main__':
-    test_envvar_expansion()
+    pytest.main(sys.argv)

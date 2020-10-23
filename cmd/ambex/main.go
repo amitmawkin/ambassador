@@ -1,4 +1,4 @@
-package main
+package ambex
 
 /**********************************************
  * ambex: Ambassador Experimental ADS server
@@ -8,7 +8,7 @@ package main
  * go-control-plane, several different classes manage this stuff:
  *
  * - The root of the world is a SnapshotCache.
- *   - import github.com/envoyproxy/go-control-plane/pkg/cache, then refer
+ *   - import github.com/datawire/ambassador/pkg/envoy-control-plane/cache/v2, then refer
  *     to cache.SnapshotCache.
  *   - A collection of internally consistent configuration objects is a
  *     Snapshot (cache.Snapshot).
@@ -19,7 +19,7 @@ package main
  * - The SnapshotCache can only hold go-control-plane configuration objects,
  *   so you have to build these up to hand to the SnapshotCache.
  * - The gRPC stuff is handled by a Server.
- *   - import github.com/envoyproxy/go-control-plane/pkg/server, then refer
+ *   - import github.com/datawire/ambassador/pkg/envoy-control-plane/server, then refer
  *     to server.Server.
  *   - Our runManagementServer (largely ripped off from the go-control-plane
  *     tests) gets this running. It takes a SnapshotCache (cleverly called a
@@ -51,26 +51,34 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/fsnotify/fsnotify"
+	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 
-	log "github.com/sirupsen/logrus"
+	// protobuf library
+	"github.com/golang/protobuf/jsonpb"
+	"github.com/golang/protobuf/proto"
+	"github.com/golang/protobuf/ptypes"
+	"github.com/golang/protobuf/ptypes/any"
 
-	// TODO(lukeshu): switch this over to use
-	// github.com/datawire/ambassador/go/apis/envoy instead of
-	// github.com/envoyproxy/go-control-plane/envoy
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2"
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
-	"github.com/envoyproxy/go-control-plane/pkg/cache"
-	"github.com/envoyproxy/go-control-plane/pkg/server"
+	// envoy control plane
+	ctypes "github.com/datawire/ambassador/pkg/envoy-control-plane/cache/types"
+	"github.com/datawire/ambassador/pkg/envoy-control-plane/cache/v2"
+	"github.com/datawire/ambassador/pkg/envoy-control-plane/server/v2"
 
-	bootstrap "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v2"
-	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v2"
-
-	"github.com/fsnotify/fsnotify"
-
-	"github.com/gogo/protobuf/jsonpb"
-	"github.com/gogo/protobuf/proto"
-	"github.com/gogo/protobuf/types"
+	// envoy protobuf -- Be sure to import the package of any types that the Python
+	// emits a "@type" of in the generated config, even if that package is otherwise
+	// not used by ambex.
+	v2 "github.com/datawire/ambassador/pkg/api/envoy/api/v2"
+	_ "github.com/datawire/ambassador/pkg/api/envoy/api/v2/auth"
+	core "github.com/datawire/ambassador/pkg/api/envoy/api/v2/core"
+	_ "github.com/datawire/ambassador/pkg/api/envoy/config/accesslog/v2"
+	bootstrap "github.com/datawire/ambassador/pkg/api/envoy/config/bootstrap/v2"
+	_ "github.com/datawire/ambassador/pkg/api/envoy/config/filter/http/ext_authz/v2"
+	_ "github.com/datawire/ambassador/pkg/api/envoy/config/filter/http/rate_limit/v2"
+	_ "github.com/datawire/ambassador/pkg/api/envoy/config/filter/http/rbac/v2"
+	_ "github.com/datawire/ambassador/pkg/api/envoy/config/filter/network/http_connection_manager/v2"
+	discovery "github.com/datawire/ambassador/pkg/api/envoy/service/discovery/v2"
 )
 
 const (
@@ -78,9 +86,13 @@ const (
 )
 
 var (
-	debug   bool
-	adsPort uint
-	watch   bool
+	debug bool
+	watch bool
+
+	adsNetwork string
+	adsAddress string
+
+	legacyAdsPort uint
 
 	// Version is inserted at build using --ldflags -X
 	Version = "-no-version-"
@@ -88,8 +100,13 @@ var (
 
 func init() {
 	flag.BoolVar(&debug, "debug", false, "Use debug logging")
-	flag.UintVar(&adsPort, "ads", 18000, "ADS port")
 	flag.BoolVar(&watch, "watch", false, "Watch for file changes")
+
+	// TODO(lukeshu): Consider changing the default here so we don't need to put it in entrypoint.sh
+	flag.StringVar(&adsNetwork, "ads-listen-network", "tcp", "network for ADS to listen on")
+	flag.StringVar(&adsAddress, "ads-listen-address", ":18000", "address (on --ads-listen-network) for ADS to listen on")
+
+	flag.UintVar(&legacyAdsPort, "ads", 0, "port number for ADS to listen on--deprecated, use --ads-listen-address=:1234 instead")
 }
 
 // Hasher returns node ID as an ID
@@ -107,25 +124,22 @@ func (h Hasher) ID(node *core.Node) string {
 // end Hasher stuff
 
 // This feels kinda dumb.
-type logger struct{}
-
-func (logger logger) Infof(format string, args ...interface{}) {
-	log.Debugf(format, args...)
-}
-func (logger logger) Errorf(format string, args ...interface{}) {
-	log.Errorf(format, args...)
+type logger struct {
+	*logrus.Logger
 }
 
-// end logger stuff
+var log = &logger{
+	Logger: logrus.StandardLogger(),
+}
 
 // run stuff
 // RunManagementServer starts an xDS server at the given port.
-func runManagementServer(ctx context.Context, server server.Server, port uint) {
+func runManagementServer(ctx context.Context, server server.Server, adsNetwork, adsAddress string) {
 	grpcServer := grpc.NewServer()
 
-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	lis, err := net.Listen(adsNetwork, adsAddress)
 	if err != nil {
-		log.WithError(err).Fatal("failed to listen")
+		log.WithError(err).Panic("failed to listen")
 	}
 
 	// register services
@@ -135,13 +149,13 @@ func runManagementServer(ctx context.Context, server server.Server, port uint) {
 	v2.RegisterRouteDiscoveryServiceServer(grpcServer, server)
 	v2.RegisterListenerDiscoveryServiceServer(grpcServer, server)
 
-	log.WithFields(log.Fields{"port": port}).Info("Listening")
+	log.WithFields(logrus.Fields{"addr": adsNetwork + ":" + adsAddress}).Info("Listening")
 	go func() {
 		go func() {
 			err := grpcServer.Serve(lis)
 
 			if err != nil {
-				log.WithFields(log.Fields{"error": err}).Error("Management server exited")
+				log.WithFields(logrus.Fields{"error": err}).Error("Management server exited")
 			}
 		}()
 
@@ -174,7 +188,7 @@ type Validatable interface {
 }
 
 func decode(name string) (proto.Message, error) {
-	any := &types.Any{}
+	any := &any.Any{}
 	contents, err := ioutil.ReadFile(name)
 	if err != nil {
 		return nil, err
@@ -187,8 +201,8 @@ func decode(name string) (proto.Message, error) {
 		return nil, err
 	}
 
-	var m types.DynamicAny
-	err = types.UnmarshalAny(any, &m)
+	var m ptypes.DynamicAny
+	err = ptypes.UnmarshalAny(any, &m)
 	if err != nil {
 		return nil, err
 	}
@@ -226,10 +240,11 @@ func Clone(src proto.Message) proto.Message {
 }
 
 func update(config cache.SnapshotCache, generation *int, dirs []string) {
-	clusters := []cache.Resource{}  // v2.Cluster
-	endpoints := []cache.Resource{} // v2.ClusterLoadAssignment
-	routes := []cache.Resource{}    // v2.RouteConfiguration
-	listeners := []cache.Resource{} // v2.Listener
+	clusters := []ctypes.Resource{}  // v2.Cluster
+	endpoints := []ctypes.Resource{} // v2.ClusterLoadAssignment
+	routes := []ctypes.Resource{}    // v2.RouteConfiguration
+	listeners := []ctypes.Resource{} // v2.Listener
+	runtimes := []ctypes.Resource{}  // discovery.Runtime
 
 	var filenames []string
 
@@ -253,7 +268,7 @@ func update(config cache.SnapshotCache, generation *int, dirs []string) {
 			log.Warnf("%s: %v", name, e)
 			continue
 		}
-		var dst *[]cache.Resource
+		var dst *[]ctypes.Resource
 		switch m.(type) {
 		case *v2.Cluster:
 			dst = &clusters
@@ -263,26 +278,34 @@ func update(config cache.SnapshotCache, generation *int, dirs []string) {
 			dst = &routes
 		case *v2.Listener:
 			dst = &listeners
+		case *discovery.Runtime:
+			dst = &runtimes
 		case *bootstrap.Bootstrap:
 			bs := m.(*bootstrap.Bootstrap)
 			sr := bs.StaticResources
 			for _, lst := range sr.Listeners {
-				listeners = append(listeners, Clone(&lst).(cache.Resource))
+				listeners = append(listeners, Clone(lst).(ctypes.Resource))
 			}
 			for _, cls := range sr.Clusters {
-				clusters = append(clusters, Clone(&cls).(cache.Resource))
+				clusters = append(clusters, Clone(cls).(ctypes.Resource))
 			}
 			continue
 		default:
 			log.Warnf("Unrecognized resource %s: %v", name, e)
 			continue
 		}
-		*dst = append(*dst, m.(cache.Resource))
+		*dst = append(*dst, m.(ctypes.Resource))
 	}
 
 	version := fmt.Sprintf("v%d", *generation)
 	*generation++
-	snapshot := cache.NewSnapshot(version, endpoints, clusters, routes, listeners)
+	snapshot := cache.NewSnapshot(
+		version,
+		endpoints,
+		clusters,
+		routes,
+		listeners,
+		runtimes)
 
 	err := snapshot.Consistent()
 
@@ -293,7 +316,7 @@ func update(config cache.SnapshotCache, generation *int, dirs []string) {
 	}
 
 	if err != nil {
-		log.Fatalf("Snapshot error %q for %+v", err, snapshot)
+		log.Panicf("Snapshot error %q for %+v", err, snapshot)
 	} else {
 		// log.Infof("Snapshot %+v", snapshot)
 		log.Infof("Pushing snapshot %+v", version)
@@ -342,18 +365,29 @@ func (l logger) OnFetchResponse(req *v2.DiscoveryRequest, res *v2.DiscoveryRespo
 	l.Infof("Fetch response: %v -> %v", req, res)
 }
 
-func main() {
-	flag.Parse()
+func Main() {
+	MainContext(context.Background())
+}
+
+func MainContext(parent context.Context) {
+	if !flag.Parsed() {
+		flag.Parse()
+	}
+	if legacyAdsPort != 0 {
+		adsAddress = fmt.Sprintf(":%v", legacyAdsPort)
+	}
 
 	if debug {
-		log.SetLevel(log.DebugLevel)
+		log.SetLevel(logrus.DebugLevel)
+	} else {
+		log.SetLevel(logrus.WarnLevel)
 	}
 
 	log.Infof("Ambex %s starting...", Version)
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		log.WithError(err).Fatal()
+		log.WithError(err).Panic()
 	}
 	defer watcher.Close()
 
@@ -372,18 +406,18 @@ func main() {
 	ch := make(chan os.Signal)
 	signal.Notify(ch, syscall.SIGHUP, os.Interrupt, syscall.SIGTERM)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
-	config := cache.NewSnapshotCache(true, Hasher{}, logger{})
-	srv := server.NewServer(config, logger{})
+	config := cache.NewSnapshotCache(true, Hasher{}, log)
+	srv := server.NewServer(ctx, config, log)
 
-	runManagementServer(ctx, srv, adsPort)
+	runManagementServer(ctx, srv, adsNetwork, adsAddress)
 
 	pid := os.Getpid()
 	file := "ambex.pid"
 	if !warn(ioutil.WriteFile(file, []byte(fmt.Sprintf("%v", pid)), 0644)) {
-		log.WithFields(log.Fields{"pid": pid, "file": file}).Info("Wrote PID")
+		log.WithFields(logrus.Fields{"pid": pid, "file": file}).Info("Wrote PID")
 	}
 
 	generation := 0
@@ -404,6 +438,8 @@ OUTER:
 			update(config, &generation, dirs)
 		case err := <-watcher.Errors:
 			log.WithError(err).Warn("Watcher error")
+		case <-parent.Done():
+			break OUTER
 		}
 
 	}

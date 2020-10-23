@@ -57,6 +57,22 @@ func (p *Process) Logf(format string, args ...interface{}) {
 	p.supervisor.Logger.Printf("%s: %v", p.Worker().Name, fmt.Sprintf(format, args...))
 }
 
+// We would _like_ to have Debug and Debugf, but we can't really support that with
+// dlog right now. So for now, these are no-ops.
+func (p *Process) Debug(obj interface{}) {
+	// Yes, this is a no-op, see above.
+	if false {
+		p.supervisor.Logger.Printf("%s: %v", p.Worker().Name, obj)
+	}
+}
+
+func (p *Process) Debugf(format string, args ...interface{}) {
+	// Yes, this is a no-op, see above.
+	if false {
+		p.supervisor.Logger.Printf("%s: %v", p.Worker().Name, fmt.Sprintf(format, args...))
+	}
+}
+
 func (p *Process) allocateID() int64 {
 	return atomic.AddInt64(&p.Worker().children, 1)
 }
@@ -104,10 +120,11 @@ func (p *Process) Do(fn func() error) (err error) {
 
 // DoClean is the same as Process.Do() but executes the supplied clean
 // function on abort.
-func (p *Process) DoClean(fn, clean func() error) (err error) {
+func (p *Process) DoClean(fn, clean func() error) error {
 	sup := p.Supervisor()
-	done := make(chan struct{})
+	done := make(chan error)
 	go func() {
+		var err error
 		defer func() {
 			if r := recover(); r != nil {
 				stack := string(debug.Stack())
@@ -116,6 +133,10 @@ func (p *Process) DoClean(fn, clean func() error) (err error) {
 				sup.errors = append(sup.errors, err)
 				sup.wantsShutdown = true
 				sup.mutex.Unlock()
+			}
+			select {
+			case done <- err:
+			default: // don't block if p.Shutdown() caused us to return early
 			}
 			close(done)
 		}()
@@ -126,7 +147,7 @@ func (p *Process) DoClean(fn, clean func() error) (err error) {
 	select {
 	case <-p.Shutdown():
 		return clean()
-	case <-done:
-		return
+	case err := <-done:
+		return err
 	}
 }

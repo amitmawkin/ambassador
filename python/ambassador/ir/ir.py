@@ -11,10 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License
-from typing import Any, Callable, Dict, Iterable, List, Optional, Type, Union, ValuesView
+from typing import Any, Callable, Dict, Iterable, List, Optional, Union, ValuesView
 from typing import cast as typecast
 
-import datetime
 import json
 import logging
 import os
@@ -24,9 +23,8 @@ from ipaddress import ip_address
 from ..constants import Constants
 
 from ..utils import RichStatus, SavedSecret, SecretHandler, SecretInfo
+from ..cache import Cache, NullCache
 from ..config import Config
-from ..config import ACResource
-from ..config import ResourceFetcher
 
 from .irresource import IRResource
 from .irambassador import IRAmbassador
@@ -35,14 +33,16 @@ from .irfilter import IRFilter
 from .ircluster import IRCluster
 from .irbasemappinggroup import IRBaseMappingGroup
 from .irbasemapping import IRBaseMapping
+from .irhttpmapping import IRHTTPMapping
+from .irhost import IRHost, HostFactory
 from .irmappingfactory import MappingFactory
 from .irratelimit import IRRateLimit
 from .irtls import TLSModuleFactory, IRAmbassadorTLS
 from .irlistener import ListenerFactory, IRListener
 from .irlogservice import IRLogService, IRLogServiceFactory
 from .irtracing import IRTracing
-from .irtlscontext import IRTLSContext
-from .irserviceresolver import IRServiceResolver, IRServiceResolverFactory, SvcEndpoint, SvcEndpointSet
+from .irtlscontext import IRTLSContext, TLSContextFactory
+from .irserviceresolver import IRServiceResolver, IRServiceResolverFactory, SvcEndpointSet
 
 from ..VERSION import Version, Build
 
@@ -52,7 +52,23 @@ from ..VERSION import Version, Build
 ## After getting an ambassador.Config, you can create an ambassador.IR. The
 ## IR is the basis for everything else: you can use it to configure an Envoy
 ## or to run diagnostics.
+##
+## IRs are not meant to be terribly long-lived: if anything at all changes
+## in your world, you should toss the IR and make a new one. In particular,
+## it is _absolutely not OK_ to try to edit the contents of an IR and then
+## re-run any of the generators -- IRs are to be considered immutable once
+## created.
+##
+## This goes double in the incremental-reconfiguration world: the IRResources
+## that make up the IR all point back to their IR to make life easier on the
+## generators, so - to ease the transition to the incremental-reconfiguration
+## world - right now we reset the IR pointer when we pull these objects out
+## the cache. In the future this should be fixed, but at present, you can
+## really mess up your world if you try to have two active IRs sharing a
+## cache.
 
+
+IRFileChecker = Callable[[str], bool]
 
 class IR:
     ambassador_module: IRAmbassador
@@ -60,11 +76,17 @@ class IR:
     ambassador_namespace: str
     ambassador_nodename: str
     aconf: Config
+    cache: Cache
     clusters: Dict[str, IRCluster]
-    file_checker: Callable[[str], bool]
+    agent_active: bool
+    agent_service: Optional[str]
+    agent_origination_ctx: Optional[IRTLSContext]
+    edge_stack_allowed: bool
+    file_checker: IRFileChecker
     filters: List[IRFilter]
     groups: Dict[str, IRBaseMappingGroup]
     grpc_services: Dict[str, IRCluster]
+    hosts: Dict[str, IRHost]
     listeners: List[IRListener]
     log_services: Dict[str, IRLogService]
     ratelimit: Optional[IRRateLimit]
@@ -75,20 +97,34 @@ class IR:
     saved_secrets: Dict[str, SavedSecret]
     secret_handler: SecretHandler
     secret_root: str
+    sidecar_cluster_name: Optional[str]
     tls_contexts: Dict[str, IRTLSContext]
     tls_module: Optional[IRAmbassadorTLS]
     tracing: Optional[IRTracing]
 
-    def __init__(self, aconf: Config, secret_handler=None, file_checker=None) -> None:
+    def __init__(self, aconf: Config,
+                 secret_handler: SecretHandler, 
+                 file_checker: Optional[IRFileChecker]=None,
+                 logger: Optional[logging.Logger]=None, 
+                 cache: Optional[Cache]=None, 
+                 watch_only=False) -> None:
+        # Initialize the basics...
         self.ambassador_id = Config.ambassador_id
         self.ambassador_namespace = Config.ambassador_namespace
         self.ambassador_nodename = aconf.ambassador_nodename
         self.statsd = aconf.statsd
 
-        self.logger = logging.getLogger("ambassador.ir")
+        # ...then make sure we have a logger...
+        self.logger = logger or logging.getLogger("ambassador.ir")
+
+        # ...then make sure we have a cache (which might be a NullCache).
+        self.cache = cache or NullCache(self.logger)
 
         # We're using setattr since since mypy complains about assigning directly to a method.
         secret_root = os.environ.get('AMBASSADOR_CONFIG_BASE_DIR', "/ambassador")
+
+        # This setattr business is because mypy seems to think that, since self.file_checker is 
+        # callable, any mention of self.file_checker must be a function call. Sigh.
         setattr(self, 'file_checker', file_checker if file_checker is not None else os.path.isfile)
 
         # The secret_handler is _required_.
@@ -108,7 +144,6 @@ class IR:
 
         # First up: save the Config object. Its source map may be necessary later.
         self.aconf = aconf
-        self.k8s_status_updates = aconf.k8s_status_updates
 
         # Next, we'll want a way to keep track of resources we end up working
         # with. It starts out empty.
@@ -118,23 +153,42 @@ class IR:
         self.saved_secrets = {}
         self.secret_info: Dict[str, SecretInfo] = {}
 
-        # ...and the initial IR state is empty.
+        # ...and the initial IR state is empty _except for k8s_status_updates_.
         #
         # Note that we use a map for clusters, not a list -- the reason is that
         # multiple mappings can use the same service, and we don't want multiple
         # clusters.
+
+        self.breakers = {}
         self.clusters = {}
         self.filters = []
+        self.groups = {}
         self.grpc_services = {}
+        self.hosts = {}
+        # self.k8s_status_updates is handled below.
         self.listeners = []
         self.log_services = {}
-        self.groups = {}
+        self.outliers = {}
         self.ratelimit = None
         self.redirect_cleartext_from = None
         self.resolvers = {}
+        self.saved_secrets = {}
+        self.secret_info = {}
+        self.services = {}
+        self.sidecar_cluster_name = None
         self.tls_contexts = {}
         self.tls_module = None
         self.tracing = None
+
+        # Copy k8s_status_updates from our aconf.
+        self.k8s_status_updates = aconf.k8s_status_updates
+
+        # Check on the intercept agent and edge stack. Note that the Edge Stack touchfile is _not_
+        # within $AMBASSADOR_CONFIG_BASE_DIR: it stays in /ambassador no matter what.
+
+        self.agent_active = (os.environ.get("AGENT_SERVICE", None) != None)
+        self.edge_stack_allowed = os.path.exists('/ambassador/.edge_stack')
+        self.agent_origination_ctx = None
 
         # OK, time to get this show on the road. First things first: set up the
         # Ambassador module.
@@ -159,13 +213,42 @@ class IR:
         # this though.
 
         TLSModuleFactory.load_all(self, aconf)
-        self.save_tls_contexts(aconf)
+        TLSContextFactory.load_all(self, aconf)
+
+        # ...then grab whatever we know about Hosts...
+        HostFactory.load_all(self, aconf)
+
+        # ...then set up for the intercept agent, if that's a thing.
+        self.agent_init(aconf)
+
+        # Finally, finalize all the Host stuff (including the !*@#&!* fallback context).
+        HostFactory.finalize(self, aconf)
 
         # Now we can finalize the Ambassador module, to tidy up secrets et al. We do this
         # here so that secrets and TLS contexts are available.
         if not self.ambassador_module.finalize(self, aconf):
             # Uhoh.
             self.ambassador_module.set_active(False)    # This can't be good.
+
+        _activity_str = 'watching' if watch_only else 'starting'
+        _mode_str = 'OSS'
+
+        if self.agent_active:
+            _mode_str = 'Intercept Agent'
+        elif self.edge_stack_allowed:
+            _mode_str = 'Edge Stack'
+
+        self.logger.debug(f"IR: {_activity_str} {_mode_str}")
+
+        # Next up, initialize our IRServiceResolvers...
+        IRServiceResolverFactory.load_all(self, aconf)
+
+        # ...and then we can finalize the agent, if that's a thing.
+        self.agent_finalize(aconf)
+
+        # Once here, if we're only watching, we're done.
+        if watch_only:
+            return
 
         # REMEMBER FOR SAVING YOU NEED TO CALL save_resource!
         # THIS IS VERY IMPORTANT!
@@ -175,31 +258,26 @@ class IR:
         self.outliers = aconf.get_config("OutlierDetection") or {}
         self.services = aconf.get_config("service") or {}
 
-        self.cluster_ingresses_to_mappings()
-
-        # Next up, initialize our IRServiceResolvers.
-        IRServiceResolverFactory.load_all(self, aconf)
-
         # Save tracing, ratelimit, and logging settings.
         self.tracing = typecast(IRTracing, self.save_resource(IRTracing(self, aconf)))
         self.ratelimit = typecast(IRRateLimit, self.save_resource(IRRateLimit(self, aconf)))
         IRLogServiceFactory.load_all(self, aconf)
 
         # After the Ambassador and TLS modules are done, we need to set up the
-        # filter chains, which requires checking in on the auth, and
-        # ratelimit configuration. Note that order of the filters matter.
+        # filter chains. Note that order of the filters matters. Start with auth,
+        # since it needs to be able to override everything...
         self.save_filter(IRAuth(self, aconf))
-
-        # ...note that ratelimit is a filter too...
-        if self.ratelimit:
-            self.save_filter(self.ratelimit, already_saved=True)
 
         # ...then deal with the non-configurable cors filter...
         self.save_filter(IRFilter(ir=self, aconf=aconf,
                                   rkey="ir.cors", kind="ir.cors", name="cors",
                                   config={}))
 
-        # ...and the marginally-configurable router filter.
+        # ...then the ratelimit filter...
+        if self.ratelimit:
+            self.save_filter(self.ratelimit, already_saved=True)
+
+        # ...and, finally, the barely-configurable router filter.
         router_config = {}
 
         if self.tracing:
@@ -221,17 +299,30 @@ class IR:
         ListenerFactory.finalize(self, aconf)
         MappingFactory.finalize(self, aconf)
 
-        # At this point we should know the full set of clusters, so we can normalize
-        # any long cluster names.
+        # At this point we should know the full set of clusters, so we can generate
+        # appropriate envoy names.
+        #
+        # Envoy cluster name generation happens in two steps. First, we check every
+        # cluster and set the envoy name to the cluster name if it is short enough.
+        # If it isn't, we group all of the long cluster names by a common prefix
+        # and normalize them later.
+        #
+        # This ensures that:
+        # - All IRCluster objects have an envoy_name
+        # - All envoy_name fields are valid cluster names, ie: they are short enough
         collisions: Dict[str, List[str]] = {}
 
         for name in sorted(self.clusters.keys()):
             if len(name) > 60:
-                # Too long.
+                # Too long. Gather this cluster by name prefix and normalize
+                # its name below.
                 short_name = name[0:40]
 
                 collision_list = collisions.setdefault(short_name, [])
                 collision_list.append(name)
+            else:
+                # Short enough, set the envoy name to the cluster name.
+                self.clusters[name]['envoy_name'] = name
 
         for short_name in sorted(collisions.keys()):
             name_list = collisions[short_name]
@@ -242,8 +333,23 @@ class IR:
                 mangled_name = "%s-%d" % (short_name, i)
                 i += 1
 
-                self.logger.info("%s => %s" % (name, mangled_name))
-                self.clusters[name]['name'] = mangled_name
+                self.logger.debug("%s => %s" % (name, mangled_name))
+
+                # We must not modify a cluster's name (nor its rkey, for that matter)
+                # because our object caching implementation depends on stable object
+                # names and keys. If we were to update it, we could lose track of an
+                # existing object and accidentally create a duplicate (tested in
+                # python/tests/test_cache.py test_long_cluster_1).
+                #
+                # Instead, the resulting IR must set envoy_name to the mangled name, which
+                # is guaranteed to be valid in envoy configuration.
+                #
+                # An important consequence of this choice is that we must never read back
+                # envoy config to create IRCluster config, since the cluster names are
+                # not necessarily the same. This is currently fine, since we never use
+                # envoy config as a source of truth - we leave that to the cluster annotations
+                # and CRDs.
+                self.clusters[name]['envoy_name'] = mangled_name
 
         # After we have the cluster names fixed up, go finalize filters.
         if self.tracing:
@@ -257,14 +363,223 @@ class IR:
 
     # XXX Brutal hackery here! Probably this is a clue that Config and IR and such should have
     # a common container that can hold errors.
-    def post_error(self, rc: Union[str, RichStatus], resource: Optional[IRResource]=None, rkey: Optional[str]=None):
-        self.aconf.post_error(rc, resource=resource, rkey=rkey)
+    def post_error(self, rc: Union[str, RichStatus], resource: Optional[IRResource]=None, rkey: Optional[str]=None, log_level=logging.INFO):
+        self.aconf.post_error(rc, resource=resource, rkey=rkey, log_level=log_level)
+
+    def agent_init(self, aconf: Config) -> None:
+        """
+        Initialize as the Intercept Agent, if we're doing that.
+
+        THIS WHOLE METHOD NEEDS TO GO AWAY: instead, just configure the agent with CRDs as usual.
+        However, that's just too painful to contemplate without `edgectl inject-agent`.
+
+        :param aconf: Config to work with
+        :return: None
+        """
+
+        # Intercept stuff is an Edge Stack thing.
+        if not (self.edge_stack_allowed and self.agent_active):
+            self.logger.debug("Intercept agent not active, skipping initialization")
+            return
+
+        self.agent_service = os.environ.get("AGENT_SERVICE", None)
+
+        if self.agent_service is None:
+            # This is technically impossible, but whatever.
+            self.logger.info("Intercept agent active but no AGENT_SERVICE? skipping initialization")
+            self.agent_active = False
+            return
+
+        self.logger.debug(f"Intercept agent active for {self.agent_service}, initializing")
+
+        # We're going to either create a Host to terminate TLS, or to do cleartext. In neither
+        # case will we do ACME. Set additionalPort to -1 so we don't grab 8080 in the TLS case.
+        host_args: Dict[str, Any] = {
+            "hostname": "*",
+            "selector": {
+                "matchLabels": {
+                    "intercept": self.agent_service
+                }
+            },
+            "acmeProvider": {
+                "authority": "none"
+            },
+            "requestPolicy": {
+                "insecure": {
+                    "additionalPort": -1,
+                },
+            },
+        }
+
+        # Have they asked us to do TLS?
+        agent_termination_secret = os.environ.get("AGENT_TLS_TERM_SECRET", None)
+
+        if agent_termination_secret:
+            # Yup.
+            host_args["tlsSecret"] = { "name": agent_termination_secret }
+        else:
+            # No termination secret, so do cleartext.
+            host_args["requestPolicy"]["insecure"]["action"] = "Route"
+
+        host = IRHost(self, aconf, rkey=self.ambassador_module.rkey, location=self.ambassador_module.location,
+                      name="agent-host",
+                      **host_args)
+
+        if host.is_active():
+            host.referenced_by(self.ambassador_module)
+            host.sourced_by(self.ambassador_module)
+
+            self.logger.debug(f"Intercept agent: saving host {host.pretty()}")
+            # self.logger.debug(host.as_json())
+            self.save_host(host)
+        else:
+            self.logger.debug(f"Intercept agent: not saving inactive host {host.pretty()}")
+
+        # How about originating TLS?
+        agent_origination_secret = os.environ.get("AGENT_TLS_ORIG_SECRET", None)
+
+        if agent_origination_secret:
+            # Uhhhh. Synthesize a TLSContext for this, I guess.
+            #
+            # XXX What if they already have a context with this name?
+            ctx = IRTLSContext(self, aconf, rkey=self.ambassador_module.rkey, location=self.ambassador_module.location,
+                               name="agent-origination-context",
+                               secret=agent_origination_secret)
+
+            ctx.referenced_by(self.ambassador_module)
+            self.save_tls_context(ctx)
+
+            self.logger.debug(f"Intercept agent: saving origination TLSContext {ctx.name}")
+            # self.logger.debug(ctx.as_json())
+
+            self.agent_origination_ctx = ctx
+
+    def agent_finalize(self, aconf) -> None:
+        if not (self.edge_stack_allowed and self.agent_active):
+            self.logger.debug(f"Intercept agent not active, skipping finalization")
+            return
+
+        # self.logger.info(f"Intercept agent active for {self.agent_service}, finalizing")
+
+        # We don't want to listen on the default AES ports (8080, 8443) as that is likely to
+        # conflict with the user's application running in the same Pod.
+        agent_listen_port_str = os.environ.get("AGENT_LISTEN_PORT", None)
+
+        agent_grpc = os.environ.get("AGENT_ENABLE_GRPC", "false")
+
+        if agent_listen_port_str is None:
+            self.ambassador_module.service_port = Constants.SERVICE_PORT_AGENT
+        else:
+            try:
+                self.ambassador_module.service_port = int(agent_listen_port_str)
+            except ValueError:
+                self.post_error(f"Intercept agent listen port {agent_listen_port_str} is not valid")
+                self.agent_active = False
+                return
+
+        agent_port_str = os.environ.get("AGENT_PORT", None)
+
+        if agent_port_str is None:
+            self.post_error("Intercept agent requires both AGENT_SERVICE and AGENT_PORT to be set")
+            self.agent_active = False
+            return
+
+        agent_port = -1
+
+        try:
+            agent_port = int(agent_port_str)
+        except:
+            self.post_error(f"Intercept agent port {agent_port_str} is not valid")
+            self.agent_active = False
+            return
+
+        # self.logger.info(f"Intercept agent active for {self.agent_service}:{agent_port}, adding fallback mapping")
+
+        # XXX OMG this is a crock. Don't use precedence -1000000 for this, because otherwise Edge
+        # Stack might decide it's the Edge Policy Console fallback mapping and force it to be
+        # routed insecure. !*@&#*!@&#* We need per-mapping security settings.
+        #
+        # XXX What if they already have a mapping with this name?
+
+        ctx_name = None
+
+        if self.agent_origination_ctx:
+            ctx_name = self.agent_origination_ctx.name
+
+        mapping = IRHTTPMapping(self, aconf, rkey=self.ambassador_module.rkey, location=self.ambassador_module.location,
+                                name="agent-fallback-mapping",
+                                metadata_labels={"ambassador_diag_class": "private"},
+                                prefix="/",
+                                rewrite="/",
+                                service=f"127.0.0.1:{agent_port}",
+                                grpc=agent_grpc,
+                                # Making sure we don't have shorter timeouts on intercepts than the original Mapping
+                                timeout_ms=60000,
+                                idle_timeout_ms=60000,
+                                tls=ctx_name,
+                                precedence=-999999) # No, really. See comment above.
+
+        mapping.referenced_by(self.ambassador_module)
+        self.add_mapping(aconf, mapping)
+
+    def cache_fetch(self, key: str) -> Optional[IRResource]:
+        """
+        Fetch a key from our cache. If we get anything, make sure that its
+        IR pointer is set back to us -- since the cache can easily outlive 
+        the IR, chances are pretty high that the object might've originally
+        been part of a different IR.
+
+        Yes, this implies that trying to use the cache for multiple IRs at
+        the same time is a Very Bad Idea.
+        """
+
+        rsrc = self.cache[key]
+
+        # Did we get anything?
+        if rsrc is not None:
+            # By definition, anything the IR layer pulls from the cache must be
+            # an IRResource.
+            assert(isinstance(rsrc, IRResource))
+
+            # Since it's an IRResource, it has a pointer to the IR. Reset that.
+            rsrc.ir = self
+
+        return rsrc
+
+    def cache_add(self, rsrc: IRResource) -> None:
+        """
+        Add an IRResource to our cache. Mostly this is here to let mypy check
+        that everything cached by the IR layer is an IRResource.
+        """
+        self.cache.add(rsrc)
+
+    def cache_link(self, owner: IRResource, owned: IRResource) -> None:
+        """
+        Link two IRResources in our cache. Mostly this is here to let mypy check
+        that everything linked by the IR layer is an IRResource.
+        """
+        self.cache.link(owner, owned)
 
     def save_resource(self, resource: IRResource) -> IRResource:
         if resource.is_active():
             self.saved_resources[resource.rkey] = resource
 
         return resource
+
+    def save_host(self, host: IRHost) -> None:
+        extant_host = self.hosts.get(host.name, None)
+        is_valid = True
+
+        if extant_host:
+            self.post_error("Duplicate Host %s; keeping definition from %s" % (host.name, extant_host.location))
+            is_valid = False
+
+        if is_valid:
+            self.hosts[host.name] = host
+
+    # Get saved hosts.
+    def get_hosts(self) -> List[IRHost]:
+        return list(self.hosts.values())
 
     # Save secrets from our aconf.
     def save_secret_info(self, aconf):
@@ -273,25 +588,13 @@ class IR:
 
         for secret_key, aconf_secret in aconf_secrets.items():
             # Ignore anything that doesn't at least have a public half.
-            if aconf_secret.get('tls_crt'):
+            if aconf_secret.get('tls_crt') or aconf_secret.get('cert-chain_pem'):
                 secret_info = SecretInfo.from_aconf_secret(aconf_secret)
                 secret_name = secret_info.name
                 secret_namespace = secret_info.namespace
 
                 self.logger.debug(f'saving {secret_name}.{secret_namespace} (from {secret_key}) in secret_info')
                 self.secret_info[f'{secret_name}.{secret_namespace}'] = secret_info
-
-    # Save TLS contexts from the aconf into the IR. Note that the contexts in the aconf
-    # are just ACResources; they need to be turned into IRTLSContexts.
-    def save_tls_contexts(self, aconf):
-        tls_contexts = aconf.get_config('tls_contexts')
-
-        if tls_contexts is not None:
-            for config in tls_contexts.values():
-                ctx = IRTLSContext(self, config)
-
-                if ctx.is_active():
-                    self.save_tls_context(ctx)
 
     def save_tls_context(self, ctx: IRTLSContext) -> None:
         extant_ctx = self.tls_contexts.get(ctx.name, None)
@@ -301,12 +604,12 @@ class IR:
             self.post_error("Duplicate TLSContext %s; keeping definition from %s" % (ctx.name, extant_ctx.location))
             is_valid = False
 
-        if ctx.redirect_cleartext_from is not None:
+        if ctx.get('redirect_cleartext_from', None) is not None:
             if self.redirect_cleartext_from is None:
                 self.redirect_cleartext_from = ctx.redirect_cleartext_from
             else:
                 if self.redirect_cleartext_from != ctx.redirect_cleartext_from:
-                    self.post_error("TLSContext: %s; configured conflicting redirect_from port: %d" % (ctx.name, ctx.redirect_cleartext_from))
+                    self.post_error("TLSContext: %s; configured conflicting redirect_from port: %s" % (ctx.name, ctx.redirect_cleartext_from))
                     is_valid = False
 
         if is_valid:
@@ -318,8 +621,8 @@ class IR:
     def add_resolver(self, resolver: IRServiceResolver) -> None:
         self.resolvers[resolver.name] = resolver
 
-    # def has_tls_context(self, name: str) -> bool:
-    #     return bool(self.get_tls_context(name))
+    def has_tls_context(self, name: str) -> bool:
+        return bool(self.get_tls_context(name))
 
     def get_tls_context(self, name: str) -> Optional[IRTLSContext]:
         return self.tls_contexts.get(name, None)
@@ -327,26 +630,7 @@ class IR:
     def get_tls_contexts(self) -> ValuesView[IRTLSContext]:
         return self.tls_contexts.values()
 
-    def resolve_secret(self, context: IRTLSContext, secret_name: str) -> SavedSecret:
-        # Start by figuring out a namespace to look in. Assume that we're
-        # in the Ambassador's namespace...
-        namespace = self.ambassador_namespace
-
-        # You can't just always allow '.' in a secret name to span namespaces, or you end up with
-        # https://github.com/datawire/ambassador/issues/1255, which is particularly problematic
-        # because (https://github.com/datawire/ambassador/issues/1475) Istio likes to use '.' in
-        # mTLS secret names. So we default to allowing the '.' as a namespace separator, but
-        # you can set secret_namespacing to False in a TLSContext or tls_secret_namespacing False
-        # in the Ambassador module's defaults to prevent that.
-
-        secret_namespacing = context.lookup('secret_namespacing', True,
-                                            default_key='tls_secret_namespacing')
-
-        self.logger.info(f"resolve_secret {secret_name}, namespace {namespace}: namespacing is {secret_namespacing}")
-
-        if "." in secret_name and secret_namespacing:
-            secret_name, namespace = secret_name.split('.', 1)
-
+    def resolve_secret(self, resource: IRResource, secret_name: str, namespace: str):
         # OK. Do we already have a SavedSecret for this?
         ss_key = f'{secret_name}.{namespace}'
 
@@ -354,37 +638,39 @@ class IR:
 
         if ss:
             # Done. Return it.
-            self.logger.info(f"resolve_secret {ss_key}: using cached SavedSecret")
+            self.logger.debug(f"resolve_secret {ss_key}: using cached SavedSecret")
+            self.secret_handler.still_needed(resource, secret_name, namespace)
             return ss
 
         # OK, do we have a secret_info for it??
-        self.logger.debug(f"trying to get key {ss_key} from secret_info {self.secret_info}")
+        # self.logger.debug(f"resolve_secret {ss_key}: checking secret_info")
+
         secret_info = self.secret_info.get(ss_key, None)
 
         if secret_info:
-            self.logger.info(f"resolve_secret {ss_key}: found secret_info")
+            self.logger.debug(f"resolve_secret {ss_key}: found secret_info")
+            self.secret_handler.still_needed(resource, secret_name, namespace)
         else:
             # No secret_info, so ask the secret_handler to find us one.
-            self.logger.info(f"resolve_secret {ss_key}: asking handler to load")
-            secret_info = self.secret_handler.load_secret(context, secret_name, namespace)
+            self.logger.debug(f"resolve_secret {ss_key}: no secret_info, asking handler to load")
+            secret_info = self.secret_handler.load_secret(resource, secret_name, namespace)
 
         if not secret_info:
             self.logger.error(f"Secret {ss_key} unknown")
 
-            ss = SavedSecret(secret_name, namespace, None, None, None)
+            ss = SavedSecret(secret_name, namespace, None, None, None, None, None)
         else:
-            self.logger.info(f"resolve_secret {ss_key}: asking handler to cache")
+            self.logger.debug(f"resolve_secret {ss_key}: found secret, asking handler to cache")
 
             # OK, we got a secret_info. Cache that using the secret handler.
-            ss = self.secret_handler.cache_secret(context, secret_info)
+            ss = self.secret_handler.cache_secret(resource, secret_info)
 
             # Save this for next time.
             self.saved_secrets[secret_name] = ss
-
         return ss
 
     def resolve_targets(self, cluster: IRCluster, resolver_name: Optional[str],
-                        hostname: str, port: int) -> Optional[SvcEndpointSet]:
+                        hostname: str, namespace: str, port: int) -> Optional[SvcEndpointSet]:
         # Is the host already an IP address?
         is_ip_address = False
 
@@ -421,7 +707,7 @@ class IR:
 
         # OK, ask the resolver for the target list. Understanding the mechanics of resolution
         # and the load balancer policy and all that is up to the resolver.
-        return resolver.resolve(self, cluster, hostname, port)
+        return resolver.resolve(self, cluster, hostname, namespace, port)
 
     def save_filter(self, resource: IRFilter, already_saved=False) -> None:
         if resource.is_active():
@@ -437,144 +723,42 @@ class IR:
     def add_listener(self, listener: IRListener) -> None:
         self.listeners.append(listener)
 
-    def add_to_listener(self, listener_name: str, **kwargs) -> bool:
-        for listener in self.listeners:
-            if listener.get('name') == listener_name:
-                listener.update(kwargs)
-                return True
-        return False
-
-    def add_to_primary_listener(self, **kwargs) -> bool:
-        primary_listener = 'ir.listener'
-        return self.add_to_listener(primary_listener, **kwargs)
-
     def add_mapping(self, aconf: Config, mapping: IRBaseMapping) -> Optional[IRBaseMappingGroup]:
+        mapping.check_status()
+
         if mapping.is_active():
             if mapping.group_id not in self.groups:
-                group_name = "GROUP: %s" % mapping.name
-                group_class = mapping.group_class()
-                group = group_class(ir=self, aconf=aconf,
-                                    location=mapping.location,
-                                    name=group_name,
-                                    mapping=mapping)
+                # Is this group in our external cache?
+                group_key = mapping.group_class().key_for_id(mapping.group_id)
+                group = self.cache_fetch(group_key)
 
+                if group is not None:
+                    self.logger.debug(f"IR: got group from cache for {mapping.name}")
+                else:
+                    self.logger.debug(f"IR: synthesizing group for {mapping.name}")
+                    group_name = "GROUP: %s" % mapping.name
+                    group_class = mapping.group_class()
+                    group = group_class(ir=self, aconf=aconf,
+                                        location=mapping.location,
+                                        name=group_name,
+                                        mapping=mapping)
+
+                    self.cache_add(mapping)
+                    self.cache_add(group)
+                    self.cache_link(mapping, group)
+
+                # There's no way group can be anything but a non-None IRBaseMappingGroup
+                # here. assert() that so that mypy understands it.
+                assert(isinstance(group, IRBaseMappingGroup))   # for mypy
                 self.groups[group.group_id] = group
             else:
+                self.logger.debug(f"IR: already have group for {mapping.name}")
                 group = self.groups[mapping.group_id]
                 group.add_mapping(aconf, mapping)
 
             return group
         else:
             return None
-
-    def add_mapping_to_config(self, mapping: ACResource, mapping_identifier: str):
-        if 'mappings' not in self.aconf.config:
-            self.aconf.config['mappings'] = {}
-
-        self.aconf.config['mappings'][mapping_identifier] = mapping
-
-    def cluster_ingresses_to_mappings(self):
-        cluster_ingresses = self.aconf.get_config("ClusterIngress")
-        knative_ingresses = self.aconf.get_config("KnativeIngress")
-
-        final_knative_ingresses = {}
-        if cluster_ingresses is not None:
-            final_knative_ingresses.update(cluster_ingresses)
-        if knative_ingresses is not None:
-            final_knative_ingresses.update(knative_ingresses)
-
-        for ci_name, ci in final_knative_ingresses.items():
-            kind = ci['kind']
-            current_generation = ci['generation']
-
-            if kind == 'KnativeIngress':
-                kind = 'ingress.networking.internal.knative.dev'
-            else:
-                kind = kind.lower() + ".networking.internal.knative.dev"
-
-            self.logger.debug(f"Parsing {kind} {ci_name}")
-
-            ci_rules = ci.get('rules', [])
-            for rule_count, ci_rule in enumerate(ci_rules):
-                ci_hosts = ci_rule.get('hosts', [])
-
-                mapping_host = ""
-                for ci_host in ci_hosts:
-                    if mapping_host == "":
-                        mapping_host = ci_host
-                    else:
-                        mapping_host += "|" + ci_host
-
-                ci_http = ci_rule.get('http', None)
-                if ci_http is not None:
-                    ci_paths = ci_http.get('paths', [])
-                    for path_count, ci_path in enumerate(ci_paths):
-                        ci_headers = ci_path.get('appendHeaders', {})
-
-                        ci_splits = ci_path.get('splits', [])
-                        for split_count, ci_split in enumerate(ci_splits):
-                            unique_suffix = f"{rule_count}-{path_count}"
-                            mapping_identifier = ci_name + '-' + unique_suffix
-                            ci_mapping = {
-                                'rkey': mapping_identifier,
-                                'location': mapping_identifier,
-                                'apiVersion': 'ambassador/v1',
-                                'kind': 'Mapping',
-                                'name': mapping_identifier,
-                                'prefix': '/'
-                            }
-
-                            if mapping_host != "":
-                                ci_mapping['host'] = f"^({mapping_host})$"
-                                ci_mapping['host_regex'] = True
-
-                            split_headers = ci_split.get('appendHeaders', {})
-                            final_headers = {**ci_headers, **split_headers}
-
-                            if len(final_headers) > 0:
-                                ci_mapping['add_request_headers'] = final_headers
-
-                            ci_percent = ci_split.get('percent', None)
-                            if ci_percent is not None:
-                                ci_mapping['weight'] = ci_percent
-
-                            ci_service = ci_split.get('serviceName', None)
-                            if ci_service is None:
-                                continue
-
-                            ci_namespace = ci_split.get('serviceNamespace', 'default')
-                            ci_port = ci_split.get('servicePort', 80)
-
-                            ci_mapping['service'] = f"{ci_service}.{ci_namespace}:{ci_port}"
-
-                            self.logger.debug(f"Generated mapping from ClusterIngress: {ci_mapping}")
-                            self.add_mapping_to_config(mapping=ci_mapping, mapping_identifier=mapping_identifier)
-
-                            # Remember that we need to update status on this resource.
-                            utcnow = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-                            status_update = (kind, ci_namespace, {
-                                "observedGeneration": current_generation,
-                                "conditions": [
-                                    {
-                                        "lastTransitionTime": utcnow,
-                                        "status": "True",
-                                        "type": "LoadBalancerReady"
-                                    },
-                                    {
-                                        "lastTransitionTime": utcnow,
-                                        "status": "True",
-                                        "type": "NetworkConfigured"
-                                    },
-                                    {
-                                        "lastTransitionTime": utcnow,
-                                        "status": "True",
-                                        "type": "Ready"
-                                    }
-                                ]
-                            })
-
-                            self.logger.debug(f"Updating {ci_name}'s status to: {status_update}")
-                            self.k8s_status_updates[ci_name] = status_update
 
     def ordered_groups(self) -> Iterable[IRBaseMappingGroup]:
         return reversed(sorted(self.groups.values(), key=lambda x: x['group_weight']))
@@ -588,6 +772,10 @@ class IR:
     def add_cluster(self, cluster: IRCluster) -> IRCluster:
         if not self.has_cluster(cluster.name):
             self.clusters[cluster.name] = cluster
+
+            if cluster.is_edge_stack_sidecar():
+                # self.logger.debug(f"IR: cluster {cluster.name} is the sidecar")
+                self.sidecar_cluster_name = cluster.name
 
         return self.clusters[cluster.name]
 
@@ -624,12 +812,13 @@ class IR:
                           for cluster_name, cluster in self.clusters.items() },
             'grpc_services': { svc_name: cluster.as_dict()
                                for svc_name, cluster in self.grpc_services.items() },
+            'hosts': [ host.as_dict() for host in self.hosts.values() ],
             'listeners': [ listener.as_dict() for listener in self.listeners ],
             'filters': [ filt.as_dict() for filt in self.filters ],
             'groups': [ group.as_dict() for group in self.ordered_groups() ],
             'tls_contexts': [ context.as_dict() for context in self.tls_contexts.values() ],
             'services': self.services,
-            'k8s_status_updates': self.k8s_status_updates,
+            'k8s_status_updates': self.k8s_status_updates
         }
 
         if self.log_services:
@@ -651,6 +840,7 @@ class IR:
 
         if self.aconf.helm_chart:
             od['helm_chart'] = self.aconf.helm_chart
+        od['managed_by'] = self.aconf.pod_labels.get('app.kubernetes.io/managed-by', '')
 
         tls_termination_count = 0   # TLS termination contexts
         tls_origination_count = 0   # TLS origination contexts
@@ -683,12 +873,15 @@ class IR:
             od[key] = self.ambassador_module.get(key, {}).get('enabled', False)
 
         for key in [ 'use_proxy_proto', 'use_remote_address', 'x_forwarded_proto_redirect', 'enable_http10',
-                     'add_linkerd_headers' ]:
+                     'add_linkerd_headers', 'use_ambassador_namespace_for_service_resolution', 'proper_case', 'preserve_external_request_id' ]:
             od[key] = self.ambassador_module.get(key, False)
 
         od['service_resource_total'] = len(list(self.services.keys()))
 
         od['xff_num_trusted_hops'] = self.ambassador_module.get('xff_num_trusted_hops', 0)
+
+        od['listener_idle_timeout_ms'] = self.ambassador_module.get('listener_idle_timeout_ms', None)
+
         od['server_name'] = bool(self.ambassador_module.server_name != 'envoy')
 
         od['custom_ambassador_id'] = bool(self.ambassador_id != 'default')
@@ -696,7 +889,6 @@ class IR:
         default_port = Constants.SERVICE_PORT_HTTPS if tls_termination_count else Constants.SERVICE_PORT_HTTP
 
         od['custom_listener_port'] = bool(self.ambassador_module.service_port != default_port)
-        od['custom_diag_port'] = bool(self.ambassador_module.diag_port != Constants.DIAG_PORT)
 
         cluster_count = 0
         cluster_grpc_count = 0      # clusters using GRPC upstream
@@ -803,11 +995,11 @@ class IR:
         od['endpoint_routing_envoy_maglev_count'] = endpoint_routing_envoy_maglev_count
         od['endpoint_routing_envoy_lr_count'] = endpoint_routing_envoy_lr_count
 
-        cluster_ingresses = self.aconf.get_config("ClusterIngress")
-        od['cluster_ingress_count'] = len(cluster_ingresses.keys()) if cluster_ingresses else 0
+        od['cluster_ingress_count'] = 0  # Provided for backward compatibility only.
+        od['knative_ingress_count'] = self.aconf.get_count('knative_ingress')
 
-        knative_ingresses = self.aconf.get_config("KnativeIngress")
-        od['knative_ingress_count'] = len(knative_ingresses.keys()) if knative_ingresses else 0
+        od['k8s_ingress_count'] = len(self.aconf.k8s_ingresses)
+        od['k8s_ingress_class_count'] = len(self.aconf.k8s_ingress_classes)
 
         extauth = False
         extauth_proto: Optional[str] = None
@@ -937,5 +1129,11 @@ class IR:
         od['mapping_count'] = mapping_count
 
         od['listener_count'] = len(self.listeners)
+        od['host_count'] = len(self.hosts)
+
+        od['fast_validation'] = Config.fast_validation
+        od['fast_validation_disagreements'] = len(self.aconf.fast_validation_disagreements.keys())
+
+        # Fast reconfiguration information is supplied in check_scout in diagd.py.
 
         return od

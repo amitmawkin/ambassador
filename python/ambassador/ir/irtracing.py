@@ -1,32 +1,33 @@
 from typing import Optional, TYPE_CHECKING
 
+from .ircluster import IRCluster
+from .irresource import IRResource
 from ..config import Config
 from ..utils import RichStatus
-
-from .irresource import IRResource
-from .ircluster import IRCluster
 
 if TYPE_CHECKING:
     from .ir import IR
 
 
-class IRTracing (IRResource):
+class IRTracing(IRResource):
     cluster: Optional[IRCluster]
     service: str
     driver: str
     driver_config: dict
     tag_headers: list
     host_rewrite: Optional[str]
+    sampling: dict
 
     def __init__(self, ir: 'IR', aconf: Config,
-                 rkey: str="ir.tracing",
-                 kind: str="ir.tracing",
-                 name: str="tracing",
+                 rkey: str = "ir.tracing",
+                 kind: str = "ir.tracing",
+                 name: str = "tracing",
+                 namespace: Optional[str] = None,
                  **kwargs) -> None:
         del kwargs  # silence unused-variable warning
 
         super().__init__(
-            ir=ir, aconf=aconf, rkey=rkey, kind=kind, name=name
+            ir=ir, aconf=aconf, rkey=rkey, kind=kind, name=name, namespace=namespace
         )
         self.cluster = None
 
@@ -60,12 +61,21 @@ class IRTracing (IRResource):
             self.post_error(RichStatus.fromError("driver field is required in TracingService"))
             return False
 
+        self.namespace = config.get("namespace", self.namespace)
+
         grpc = False
         if driver == "lightstep":
             grpc = True
 
         if driver == "datadog":
             driver = "envoy.tracers.datadog"
+
+        driver_config = config.get("config", {})
+        if driver_config:
+            if 'collector_endpoint_version' in driver_config:
+                if not driver_config['collector_endpoint_version'] in ['HTTP_JSON_V1', 'HTTP_JSON', 'HTTP_PROTO']:
+                    self.post_error(RichStatus.fromError("collector_endpoint_version must be one of 'HTTP_JSON_V1, HTTP_JSON, HTTP_PROTO'"))
+                    return False
 
         # OK, we have a valid config.
         self.sourced_by(config)
@@ -74,8 +84,9 @@ class IRTracing (IRResource):
         self.driver = driver
         self.grpc = grpc
         self.cluster = None
-        self.driver_config = config.get("config", {})
+        self.driver_config = driver_config
         self.tag_headers = config.get('tag_headers', [])
+        self.sampling = config.get('sampling', {})
 
         # XXX host_rewrite actually isn't in the schema right now.
         self.host_rewrite = config.get('host_rewrite', None)
@@ -90,6 +101,7 @@ class IRTracing (IRResource):
             IRCluster(
                 ir=ir,
                 aconf=aconf,
+                parent_ir_resource=self,
                 location=self.location,
                 service=self.service,
                 host_rewrite=self.get('host_rewrite', None),
@@ -101,9 +113,6 @@ class IRTracing (IRResource):
         cluster.referenced_by(self)
         self.cluster = cluster
 
-        # if not ir.add_to_primary_listener(tracing=True):
-        #     raise Exception("Failed to update primary listener with tracing config")
-
     def finalize(self):
-        self.ir.logger.info("tracing cluster name: %s" % self.cluster.name)
-        self.driver_config['collector_cluster'] = self.cluster.name
+        self.ir.logger.debug("tracing cluster envoy name: %s" % self.cluster.envoy_name)
+        self.driver_config['collector_cluster'] = self.cluster.envoy_name

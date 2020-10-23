@@ -15,7 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/gogo/protobuf/types"
+	"github.com/golang/protobuf/ptypes"
 )
 
 // ensure the imports are used
@@ -30,8 +30,11 @@ var (
 	_ = time.Duration(0)
 	_ = (*url.URL)(nil)
 	_ = (*mail.Address)(nil)
-	_ = types.DynamicAny{}
+	_ = ptypes.DynamicAny{}
 )
+
+// define the regex for a UUID once up-front
+var _string_uuidPattern = regexp.MustCompile("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 // Validate checks the field values on StringMatcher with the rules defined in
 // the proto definition for this message. If any rules are violated, an error
@@ -40,6 +43,8 @@ func (m *StringMatcher) Validate() error {
 	if m == nil {
 		return nil
 	}
+
+	// no validation rules for IgnoreCase
 
 	switch m.MatchPattern.(type) {
 
@@ -82,17 +87,12 @@ func (m *StringMatcher) Validate() error {
 			}
 		}
 
-		{
-			tmp := m.GetSafeRegex()
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return StringMatcherValidationError{
-						field:  "SafeRegex",
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(m.GetSafeRegex()).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return StringMatcherValidationError{
+					field:  "SafeRegex",
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
@@ -180,17 +180,12 @@ func (m *ListStringMatcher) Validate() error {
 	for idx, item := range m.GetPatterns() {
 		_, _ = idx, item
 
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return ListStringMatcherValidationError{
-						field:  fmt.Sprintf("Patterns[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return ListStringMatcherValidationError{
+					field:  fmt.Sprintf("Patterns[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}

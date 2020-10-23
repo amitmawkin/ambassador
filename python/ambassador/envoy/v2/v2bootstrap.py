@@ -32,7 +32,31 @@ class V2Bootstrap(dict):
                 "cds_config": { "ads": {} },
                 "lds_config": { "ads": {} }
             },
-            "admin": dict(config.admin)
+            "admin": dict(config.admin),
+            'layered_runtime': {
+                'layers': [
+                    {
+                        'name': 'static_layer',
+                        'static_layer': {
+                            # For now, we enable the deprecated & disallowed_by_default "HTTP_JSON_V1" Zipkin
+                            # collector_endpoint_version because it repesents the Zipkin v1 API, while the
+                            # non-deprecated options HTTP_JSON and HTTP_PROTO are the Zipkin v2 API; switching
+                            # top one of them would change how Envoy talks to the outside world.
+                            'envoy.deprecated_features:envoy.config.trace.v2.ZipkinConfig.HTTP_JSON_V1': True,
+                            # Give our users more time to migrate to v2; we've said that we'll continue
+                            # supporting both for a while even after we change the default.
+                            'envoy.deprecated_features:envoy.config.filter.http.ext_authz.v2.ExtAuthz.use_alpha': True,
+                            # We haven't yet told users that we'll be deprecating `regex_type: unsafe`.
+                            'envoy.deprecated_features:envoy.api.v2.route.RouteMatch.regex': True,         # HTTP path
+                            'envoy.deprecated_features:envoy.api.v2.route.HeaderMatcher.regex_match': True, # HTTP header,
+                            # Envoy 1.14.1 disabled the use of lowercase string matcher for headers matching in HTTP-based.
+                            # Following setting toggled it to be consistent with old behavior.
+                            # AuthenticationTest (v0) is a good example that expects the old behavior. 
+                            'envoy.reloadable_features.ext_authz_http_service_enable_case_sensitive_string_matcher': False
+                        }
+                    }
+                ]
+            }
         })
 
         clusters = [{
@@ -50,6 +74,7 @@ class V2Bootstrap(dict):
                                 "endpoint": {
                                     "address": {
                                         "socket_address": {
+                                            # this should be kept in-sync with entrypoint.sh `ambex --ads-listen-address=...`
                                             "address": "127.0.0.1",
                                             "port_value": 8003,
                                             "protocol": "TCP"

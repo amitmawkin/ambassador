@@ -17,7 +17,7 @@
 # in the Makefile, then run "make update-base" to build and push the
 # new image.
 
-ARG ENVOY_BUILD_IMAGE
-FROM $ENVOY_BUILD_IMAGE
+ARG base="i-forgot-to-set-build-arg-base"
+FROM ${base}
 
-ADD ./envoy-static /usr/local/bin/envoy
+ADD ./envoy-static ./envoy-static-stripped /usr/local/bin/

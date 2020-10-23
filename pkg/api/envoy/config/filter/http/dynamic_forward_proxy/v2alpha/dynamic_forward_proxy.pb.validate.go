@@ -15,7 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/gogo/protobuf/types"
+	"github.com/golang/protobuf/ptypes"
 )
 
 // ensure the imports are used
@@ -30,8 +30,11 @@ var (
 	_ = time.Duration(0)
 	_ = (*url.URL)(nil)
 	_ = (*mail.Address)(nil)
-	_ = types.DynamicAny{}
+	_ = ptypes.DynamicAny{}
 )
+
+// define the regex for a UUID once up-front
+var _dynamic_forward_proxy_uuidPattern = regexp.MustCompile("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 // Validate checks the field values on FilterConfig with the rules defined in
 // the proto definition for this message. If any rules are violated, an error
@@ -48,17 +51,12 @@ func (m *FilterConfig) Validate() error {
 		}
 	}
 
-	{
-		tmp := m.GetDnsCacheConfig()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return FilterConfigValidationError{
-					field:  "DnsCacheConfig",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetDnsCacheConfig()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return FilterConfigValidationError{
+				field:  "DnsCacheConfig",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
@@ -119,3 +117,78 @@ var _ interface {
 	Cause() error
 	ErrorName() string
 } = FilterConfigValidationError{}
+
+// Validate checks the field values on PerRouteConfig with the rules defined in
+// the proto definition for this message. If any rules are violated, an error
+// is returned.
+func (m *PerRouteConfig) Validate() error {
+	if m == nil {
+		return nil
+	}
+
+	switch m.HostRewriteSpecifier.(type) {
+
+	case *PerRouteConfig_HostRewrite:
+		// no validation rules for HostRewrite
+
+	case *PerRouteConfig_AutoHostRewriteHeader:
+		// no validation rules for AutoHostRewriteHeader
+
+	}
+
+	return nil
+}
+
+// PerRouteConfigValidationError is the validation error returned by
+// PerRouteConfig.Validate if the designated constraints aren't met.
+type PerRouteConfigValidationError struct {
+	field  string
+	reason string
+	cause  error
+	key    bool
+}
+
+// Field function returns field value.
+func (e PerRouteConfigValidationError) Field() string { return e.field }
+
+// Reason function returns reason value.
+func (e PerRouteConfigValidationError) Reason() string { return e.reason }
+
+// Cause function returns cause value.
+func (e PerRouteConfigValidationError) Cause() error { return e.cause }
+
+// Key function returns key value.
+func (e PerRouteConfigValidationError) Key() bool { return e.key }
+
+// ErrorName returns error name.
+func (e PerRouteConfigValidationError) ErrorName() string { return "PerRouteConfigValidationError" }
+
+// Error satisfies the builtin error interface
+func (e PerRouteConfigValidationError) Error() string {
+	cause := ""
+	if e.cause != nil {
+		cause = fmt.Sprintf(" | caused by: %v", e.cause)
+	}
+
+	key := ""
+	if e.key {
+		key = "key for "
+	}
+
+	return fmt.Sprintf(
+		"invalid %sPerRouteConfig.%s: %s%s",
+		key,
+		e.field,
+		e.reason,
+		cause)
+}
+
+var _ error = PerRouteConfigValidationError{}
+
+var _ interface {
+	Field() string
+	Reason() string
+	Key() bool
+	Cause() error
+	ErrorName() string
+} = PerRouteConfigValidationError{}

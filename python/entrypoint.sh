@@ -14,6 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License
 
+if [ "${AMBASSADOR_FAST_RECONFIGURE,,}" == "true" ]; then
+  exec busyambassador entrypoint
+fi
+
 ENTRYPOINT_DEBUG=
 
 log () {
@@ -30,18 +34,6 @@ debug () {
         now=$(date +"%Y-%m-%d %H:%M:%S")
         echo "${now} AMBASSADOR DEBUG ${@}" >&2
     fi
-}
-
-in_array() {
-    local needle straw haystack
-    needle="$1"
-    haystack=("${@:2}")
-    for straw in "${haystack[@]}"; do
-        if [[ "$straw" == "$needle" ]]; then
-            return 0
-        fi
-    done
-    return 1
 }
 
 wait_for_url () {
@@ -84,10 +76,19 @@ ambassador_root="/ambassador"
 export LC_ALL=C.UTF-8
 export LANG=C.UTF-8
 
+# If we have an AGENT_SERVICE, but no AMBASSADOR_ID, force AMBASSADOR_ID
+# from the AGENT_SERVICE.
+
+if [ -z "$AMBASSADOR_ID" -a -n "$AGENT_SERVICE" ]; then
+    export AMBASSADOR_ID="intercept-${AGENT_SERVICE}"
+    log "Intercept: set AMBASSADOR_ID to $AMBASSADOR_ID"
+fi
+
 export AMBASSADOR_NAMESPACE="${AMBASSADOR_NAMESPACE:-default}"
 export AMBASSADOR_CONFIG_BASE_DIR="${AMBASSADOR_CONFIG_BASE_DIR:-$ambassador_root}"
 export ENVOY_DIR="${AMBASSADOR_CONFIG_BASE_DIR}/envoy"
 export ENVOY_BOOTSTRAP_FILE="${AMBASSADOR_CONFIG_BASE_DIR}/bootstrap-ads.json"
+export ENVOY_BASE_ID="${AMBASSADOR_ENVOY_BASE_ID:-0}"
 
 export APPDIR="${APPDIR:-$ambassador_root}"
 
@@ -117,26 +118,48 @@ fi
 # Note that the envoy_config_file really is in ENVOY_DIR, rather than
 # being in AMBASSADOR_CONFIG_BASE_DIR.
 envoy_config_file="${ENVOY_DIR}/envoy.json"         # not a typo, see above
-envoy_flags=('-c' "${ENVOY_BOOTSTRAP_FILE}")
+envoy_flags=('-c' "${ENVOY_BOOTSTRAP_FILE}" "--base-id" "${ENVOY_BASE_ID}")
+envoy_logging=('-l' 'error')
+
+if [ -n "$AGENT_SERVICE" ]; then
+    # We are the intercept agent. Force Envoy's drain time very low.
+    envoy_flags+=( "--drain-time-s" "1" )
+else
+    # We are not the intercept agent, so leave Envoy's drain time much higher.
+    drain_time="${AMBASSADOR_DRAIN_TIME:-600}"
+    debug "Using drain_time $drain_time"
+    envoy_flags+=( "--drain-time-s" "$drain_time" )
+fi
 
 # AMBASSADOR_DEBUG is a list of things to enable debugging for,
 # separated by spaces; parse that in to an array.
 read -r -d '' -a ambassador_debug <<<"$AMBASSADOR_DEBUG"
-if in_array 'diagd' "${ambassador_debug[@]}"; then diagd_flags+=('--debug'); fi
-if in_array 'envoy' "${ambassador_debug[@]}"; then envoy_flags+=('-l' 'debug'); fi
+for item in "${ambassador_debug[@]}"; do
+    case "$item" in
+        diagd)
+            debug 'AMBASSADOR_DEBUG: `diagd --debug` enabled'
+            diagd_flags+=('--debug')
+            ;;
+        envoy)
+            debug 'AMBASSADOR_DEBUG: `envoy -l debug` enabled'
+            envoy_logging=('-l' 'debug')
+            ;;
+        entrypoint)
+            debug "AMBASSADOR_DEBUG: ENTRYPOINT_DEBUG enabled"
+            ENTRYPOINT_DEBUG=true
+            ;;
+        entrypoint_trace)
+            debug "AMBASSADOR_DEBUG: ENTRYPOINT_TRACE enabled"
+            echo 2>&1
+            set -x
+            ;;
+        *)
+            debug "AMBASSADOR_DEBUG: unknown item: ${item@Q}"
+            ;;
+    esac
+done
 
-if in_array 'entrypoint'; then
-    ENTRYPOINT_DEBUG=true
-
-    debug "ENTRYPOINT_DEBUG enabled"
-fi
-
-if in_array 'entrypoint_trace'; then
-    log "ENTRYPOINT_TRACE enabled"
-
-    echo 2>&1
-    set -x
-fi
+envoy_flags+=( "${envoy_logging[@]}" )
 
 if [[ "$1" == "--demo" ]]; then
     # This is _not_ meant to be overridden by AMBASSADOR_CONFIG_BASE_DIR.
@@ -286,6 +309,11 @@ trap 'handle_chld' CHLD # Notify when a job status changes
 
 trap 'log "Received SIGINT (Control-C?); shutting down"; ambassador_exit 1' INT
 
+# Check if AMBASSADOR_DIAGD_BIND_ADDRESS is set, and if so, bind diagd server to that address.
+if [[ -n "${AMBASSADOR_DIAGD_BIND_ADDRESS}" ]]; then
+    diagd_flags+=('--host' "${AMBASSADOR_DIAGD_BIND_ADDRESS}")
+fi
+
 ################################################################################
 # WORKER: DEMO                                                                 #
 ################################################################################
@@ -298,7 +326,8 @@ fi
 # WORKER: AMBEX                                                                #
 ################################################################################
 if [[ -z "${DIAGD_ONLY}" ]]; then
-    launch "ambex" ambex -ads 8003 "${ENVOY_DIR}"
+    # Keep the listen address in-sync with v2bootstrap.py
+    launch "ambex" ambex --ads-listen-address=127.0.0.1:8003 "${ENVOY_DIR}"
 
     diagd_flags+=('--kick' "kill -HUP $$")
 else
@@ -336,7 +365,7 @@ kick_ads() {
 
         if [ -n "$AMBASSADOR_DEMO_MODE" -a -z "$demo_chimed" ]; then
             # Wait for Envoy...
-            wait_for_url "envoy" "http://localhost:8001/ready"
+            wait_for_url "envoy" "http://localhost:8877/ambassador/v0/check_ready"
 
             log "AMBASSADOR DEMO RUNNING"
             demo_chimed=yes
@@ -346,6 +375,16 @@ kick_ads() {
 
 # On SIGHUP, kick ADS
 trap 'kick_ads' HUP
+
+################################################################################
+# WORKER: TRAFFIC AGENT (app-sidecar)                                          #
+################################################################################
+# If AGENT_SERVICE is set, we start the app-sidecar. Note that we also
+# disable init-config in the ResourceFetcher when this is set!
+
+if [[ -n "${AGENT_SERVICE}" ]]; then
+    launch "app-sidecar" app-sidecar
+fi
 
 ################################################################################
 # WORKER: DIAGD                                                                #
@@ -365,39 +404,58 @@ wait_for_url "diagd" "http://localhost:8877/_internal/v0/ping"
 # WORKER: KUBEWATCH                                                            #
 ################################################################################
 if [[ -z "${AMBASSADOR_NO_KUBEWATCH}" ]]; then
-    KUBEWATCH_SYNC_KINDS="-s service"
+    watt_query_flags=(-s service)
+
+    if [ ! -f "${AMBASSADOR_CONFIG_BASE_DIR}/.ambassador_ignore_ingress_class" ]; then
+        watt_query_flags+=(-s ingressclasses)
+    fi
 
     if [ ! -f "${AMBASSADOR_CONFIG_BASE_DIR}/.ambassador_ignore_ingress" ]; then
-        KUBEWATCH_SYNC_KINDS="$KUBEWATCH_SYNC_KINDS -s ingresses"
+        watt_query_flags+=(-s ingresses)
     fi
 
     if [ ! -f "${AMBASSADOR_CONFIG_BASE_DIR}/.ambassador_ignore_crds" ]; then
-        KUBEWATCH_SYNC_KINDS="$KUBEWATCH_SYNC_KINDS -s AuthService -s LogService -s Mapping -s Module -s RateLimitService -s TCPMapping -s TLSContext -s TracingService"
+        watt_query_flags+=(-s AuthService -s Mapping -s Module -s RateLimitService -s TCPMapping -s TLSContext -s TracingService)
     fi
 
     if [ ! -f "${AMBASSADOR_CONFIG_BASE_DIR}/.ambassador_ignore_crds_2" ]; then
-        KUBEWATCH_SYNC_KINDS="$KUBEWATCH_SYNC_KINDS -s ConsulResolver -s KubernetesEndpointResolver -s KubernetesServiceResolver"
+        watt_query_flags+=(-s ConsulResolver -s KubernetesEndpointResolver -s KubernetesServiceResolver)
     fi
 
-    AMBASSADOR_FIELD_SELECTOR_ARG=""
+    if [ ! -f "${AMBASSADOR_CONFIG_BASE_DIR}/.ambassador_ignore_crds_3" ]; then
+        watt_query_flags+=(-s Host)
+    fi
+
+    if [ ! -f "${AMBASSADOR_CONFIG_BASE_DIR}/.ambassador_ignore_crds_4" ]; then
+        watt_query_flags+=(-s LogService)
+    fi
+
     if [ -n "$AMBASSADOR_FIELD_SELECTOR" ] ; then
-	    AMBASSADOR_FIELD_SELECTOR_ARG="--fields $AMBASSADOR_FIELD_SELECTOR"
+	    watt_query_flags+=(--fields $AMBASSADOR_FIELD_SELECTOR)
     fi
 
-    AMBASSADOR_LABEL_SELECTOR_ARG=""
     if [ -n "$AMBASSADOR_LABEL_SELECTOR" ] ; then
-	    AMBASSADOR_LABEL_SELECTOR_ARG="--labels $AMBASSADOR_LABEL_SELECTOR"
+	    watt_query_flags+=(--labels $AMBASSADOR_LABEL_SELECTOR)
+    fi
+
+    if [ -n "$AMBASSADOR_SINGLE_NAMESPACE" ]; then
+        watt_query_flags+=(--namespace "${AMBASSADOR_NAMESPACE}")
     fi
 
     launch "watt" watt \
-           --port 8002 \
-           ${AMBASSADOR_SINGLE_NAMESPACE:+ --namespace "${AMBASSADOR_NAMESPACE}" } \
+           --listen-address="127.0.0.1:8002" \
            --notify 'python /ambassador/post_update.py --watt ' \
-           ${KUBEWATCH_SYNC_KINDS} \
-           ${AMBASSADOR_FIELD_SELECTOR_ARG} \
-           ${AMBASSADOR_LABEL_SELECTOR_ARG} \
-           --watch /ambassador/watch_hook.py
+           --watch "python /ambassador/watch_hook.py" \
+           "${watt_query_flags[@]}"
 fi
+
+################################################################################
+# WORKER: extra sidecars                                                       #
+################################################################################
+shopt -s nullglob
+for sidecar in /ambassador/sidecars/*; do
+    launch "${sidecar##*/}" "$sidecar"
+done
 
 ################################################################################
 # Wait for one worker to quit, then kill the others                            #

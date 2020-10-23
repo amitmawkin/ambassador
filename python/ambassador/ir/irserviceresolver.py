@@ -108,18 +108,18 @@ class IRServiceResolver(IRResource):
         return valid
 
     @multi
-    def resolve(self, ir: 'IR', cluster: 'IRCluster', svc_name: str, port: int) -> str:
+    def resolve(self, ir: 'IR', cluster: 'IRCluster', svc_name: str, svc_namespace: str, port: int) -> str:
         del ir      # silence warnings
         del cluster
         del svc_name
+        del svc_namespace
         del port
 
         return self.kind
 
     @resolve.when("KubernetesServiceResolver")
-    def _k8s_svc_resolver(self, ir: 'IR', cluster: 'IRCluster', svc_name: str, port: int) -> Optional[SvcEndpointSet]:
+    def _k8s_svc_resolver(self, ir: 'IR', cluster: 'IRCluster', svc_name: str, svc_namespace: str, port: int) -> Optional[SvcEndpointSet]:
         # The K8s service resolver always returns a single endpoint.
-
         return [ {
             'ip': svc_name,
             'port': port,
@@ -127,7 +127,7 @@ class IRServiceResolver(IRResource):
         } ]
 
     @resolve.when("KubernetesEndpointResolver")
-    def _k8s_resolver(self, ir: 'IR', cluster: 'IRCluster', svc_name: str, port: int) -> Optional[SvcEndpointSet]:
+    def _k8s_resolver(self, ir: 'IR', cluster: 'IRCluster', svc_name: str, svc_namespace: str, port: int) -> Optional[SvcEndpointSet]:
         # K8s service names can be 'svc' or 'svc.namespace'. Which does this look like?
 
         svc = svc_name
@@ -141,12 +141,15 @@ class IRServiceResolver(IRResource):
             # elements if there are more, but still work if there are not.
 
             (svc, namespace) = svc.split(".", 2)[0:2]
+        elif not ir.ambassador_module.use_ambassador_namespace_for_service_resolution and svc_namespace:
+            namespace = svc_namespace
+            ir.logger.debug("KubernetesEndpointResolver use_ambassador_namespace_for_service_resolution %s, upstream key %s" % (ir.ambassador_module.use_ambassador_namespace_for_service_resolution, f'{svc}-{namespace}'))
 
         # Find endpoints, and try for a port match!
         return self.get_endpoints(ir, f'k8s-{svc}-{namespace}', port)
 
     @resolve.when("ConsulResolver")
-    def _consul_resolver(self, ir: 'IR', cluster: 'IRCluster', svc_name: str, port: int) -> Optional[SvcEndpointSet]:
+    def _consul_resolver(self, ir: 'IR', cluster: 'IRCluster', svc_name: str, svc_namespace: str, port: int) -> Optional[SvcEndpointSet]:
         # For Consul, we look things up with the service name and the datacenter at present.
         # We ignore the port in the lookup (we should've already posted a warning about the port
         # being present, actually).
@@ -158,7 +161,7 @@ class IRServiceResolver(IRResource):
         service = ir.services.get(key)
 
         if not service:
-            self.logger.debug(f'Resolver {self.name}: {key} matches no Service')
+            self.logger.debug(f'Resolver {self.name}: {key} matches no Service for endpoints')
             return None
 
         self.logger.debug(f'Resolver {self.name}: {key} matches %s' % service.as_json())
@@ -209,7 +212,7 @@ class IRServiceResolverFactory:
         if not ir.get_resolver('kubernetes-service'):
             # Default the K8s service resolver.
             resolver_config = {
-                'apiVersion': 'getambassador.io/v1',
+                'apiVersion': 'getambassador.io/v2',
                 'kind': 'KubernetesServiceResolver',
                 'name': 'kubernetes-service'
             }
@@ -227,7 +230,7 @@ class IRServiceResolverFactory:
             # Neither exists. Create them from scratch.
 
             resolver_config = {
-                'apiVersion': 'getambassador.io/v1',
+                'apiVersion': 'getambassador.io/v2',
                 'kind': 'KubernetesEndpointResolver',
                 'name': 'kubernetes-endpoint'
             }
@@ -250,7 +253,7 @@ class IRServiceResolverFactory:
             # Neither exists. Create them from scratch.
 
             resolver_config = {
-                'apiVersion': 'getambassador.io/v1',
+                'apiVersion': 'getambassador.io/v2',
                 'kind': 'ConsulResolver',
                 'name': 'consul-endpoint',
                 'datacenter': 'dc1'

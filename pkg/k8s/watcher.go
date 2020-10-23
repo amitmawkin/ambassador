@@ -1,6 +1,7 @@
 package k8s
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -28,15 +29,16 @@ func (lw listWatchAdapter) List(options v1.ListOptions) (runtime.Object, error) 
 	options.LabelSelector = lw.labelSelector
 	// silently coerce the returned *unstructured.UnstructuredList
 	// struct to a runtime.Object interface.
-	return lw.resource.List(options)
+	return lw.resource.List(context.TODO(), options)
 }
 
 func (lw listWatchAdapter) Watch(options v1.ListOptions) (pwatch.Interface, error) {
 	options.FieldSelector = lw.fieldSelector
 	options.LabelSelector = lw.labelSelector
-	return lw.resource.Watch(options)
+	return lw.resource.Watch(context.TODO(), options)
 }
 
+// Watcher is a kubernetes watcher that can watch multiple queries simultaneously
 type Watcher struct {
 	Client  *Client
 	watches map[ResourceType]watch
@@ -84,24 +86,6 @@ func (c *Client) Watcher() *Watcher {
 	}
 
 	return w
-}
-
-func (w *Watcher) Watch(resources string, listener func(*Watcher)) error {
-	return w.WatchNamespace("", resources, listener)
-}
-
-func (w *Watcher) WatchNamespace(namespace, resources string, listener func(*Watcher)) error {
-	return w.SelectiveWatch(namespace, resources, "", "", listener)
-}
-
-func (w *Watcher) SelectiveWatch(namespace, resources, fieldSelector, labelSelector string,
-	listener func(*Watcher)) error {
-	return w.WatchQuery(Query{
-		Kind:          resources,
-		Namespace:     namespace,
-		FieldSelector: fieldSelector,
-		LabelSelector: labelSelector,
-	}, listener)
 }
 
 // WatchQuery watches the set of resources identified by the supplied
@@ -190,6 +174,7 @@ func (w *Watcher) WatchQuery(query Query, listener func(*Watcher)) error {
 	return nil
 }
 
+// Start starts the watcher
 func (w *Watcher) Start() {
 	w.mutex.Lock()
 	if w.started {
@@ -229,6 +214,7 @@ func (w *Watcher) sync(kind ResourceType) {
 	}
 }
 
+// List lists all the resources with kind `kind`
 func (w *Watcher) List(kind string) []Resource {
 	ri, err := w.Client.ResolveResourceType(kind)
 	if err != nil {
@@ -247,6 +233,7 @@ func (w *Watcher) List(kind string) []Resource {
 	}
 }
 
+// UpdateStatus updates the status of the `resource` provided
 func (w *Watcher) UpdateStatus(resource Resource) (Resource, error) {
 	ri, err := w.Client.ResolveResourceType(resource.QKind())
 	if err != nil {
@@ -267,7 +254,7 @@ func (w *Watcher) UpdateStatus(resource Resource) (Resource, error) {
 		cli = watch.resource
 	}
 
-	result, err := cli.UpdateStatus(&uns, v1.UpdateOptions{})
+	result, err := cli.UpdateStatus(context.TODO(), &uns, v1.UpdateOptions{})
 	if err != nil {
 		return nil, err
 	} else {
@@ -276,6 +263,7 @@ func (w *Watcher) UpdateStatus(resource Resource) (Resource, error) {
 	}
 }
 
+// Get gets the `qname` resource (of kind `kind`)
 func (w *Watcher) Get(kind, qname string) Resource {
 	resources := w.List(kind)
 	for _, res := range resources {
@@ -286,6 +274,7 @@ func (w *Watcher) Get(kind, qname string) Resource {
 	return Resource{}
 }
 
+// Exists returns true if the `qname` resource (of kind `kind`) exists
 func (w *Watcher) Exists(kind, qname string) bool {
 	return w.Get(kind, qname).Name() != ""
 }

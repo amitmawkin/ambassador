@@ -4,7 +4,6 @@ import pytest
 from typing import ClassVar, Dict, List, Sequence, Tuple, Union
 
 from kat.harness import sanitize, variants, Query, Runner
-from kat import manifests
 
 from abstract_tests import AmbassadorTest, HTTP
 from abstract_tests import assert_default_errors, MappingTest, OptionTest, ServiceType, Node, Test
@@ -20,9 +19,7 @@ class ShadowTestCANFLAKE(MappingTest):
         self.options = None
 
     def manifests(self) -> str:
-        s = super().manifests() or ""
-
-        return s + """
+        return """
 ---
 apiVersion: v1
 kind: Service
@@ -56,11 +53,10 @@ spec:
       containers:
       - name: shadow
         image: {self.test_image[shadow]}
-        imagePullPolicy: Always
         ports:
         - name: http
           containerPort: 3000
-"""
+""" + super().manifests()
 
     def config(self):
         yield self.target, self.format("""
@@ -138,8 +134,16 @@ service: shadow.plain-namespace
         # XXX Ew. If self.results[0].json is empty, the harness won't convert it to a response.
         errors = self.results[0].json or {}
 
-        # We should _not_ be seeing Ingress errors here.
-        assert_default_errors(errors, include_ingress_errors=False)
+        # We shouldn't have any missing-CRD-types errors any more.
+        for source, error in errors:
+          if (('could not find' in error) and ('CRD definitions' in error)):
+            assert False, f"Missing CRDs: {error}"
+
+          if 'Ingress resources' in error:
+            assert False, f"Ingress resource error: {error}"
+
+        # The default errors assume that we have missing CRDs, and that's not correct any more,
+        # so don't try to use assert_default_errors here.
 
         for result in self.results:
             if "mark" in result.query.url:

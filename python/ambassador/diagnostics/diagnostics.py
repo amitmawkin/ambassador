@@ -115,7 +115,7 @@ class DiagResult:
 
         # Go ahead and grab Envoy cluster stats for all possible clusters.
         # XXX This might be a bit silly.
-        self.cluster_names = list(self.diag.clusters.keys())
+        self.cluster_names = [ cluster.envoy_name for cluster in self.diag.clusters.values() ]
         self.cstats = { name: self.estat.cluster_stats(name) for name in self.cluster_names }
 
         # Save the request host and scheme. We'll need them later.
@@ -239,8 +239,8 @@ class DiagResult:
 
             route_clusters.append(redirect_cluster)
 
-            self.logger.info("host_redirect route: %s" % group)
-            self.logger.info("host_redirect cluster: %s" % redirect_cluster)
+            self.logger.debug("host_redirect route: %s" % group)
+            self.logger.debug("host_redirect cluster: %s" % redirect_cluster)
 
         shadows = group.get('shadows', [])
 
@@ -252,8 +252,8 @@ class DiagResult:
             shadow_cluster = self.include_cluster(shadow_dict)
             route_clusters.append(shadow_cluster)
 
-            self.logger.info("shadow route: %s" % group)
-            self.logger.info("shadow cluster: %s" % shadow_cluster)
+            self.logger.debug("shadow route: %s" % group)
+            self.logger.debug("shadow cluster: %s" % shadow_cluster)
 
         headers = []
 
@@ -281,8 +281,17 @@ class DiagResult:
             'method': method,
             'headers': headers,
             'clusters': [ x.default_missing() for x in route_clusters ],
-            'host': host if host else '*'
+            'host': host if host else '*',
         }
+
+        if 'precedence' in group:
+            route_info['precedence'] = group['precedence']
+
+        metadata_labels = group.get('metadata_labels') or {}
+        diag_class = metadata_labels.get('ambassador_diag_class') or None
+
+        if diag_class:
+            route_info['diag_class'] = diag_class
 
         self.routes.append(route_info)
         self.include_referenced_elements(group)
@@ -427,11 +436,12 @@ class Diagnostics:
         #
         #         self.ir.aconf.post_notice(f'{m1} {m2}')
 
-        # Copy in the toplevel error and notice sets.
+        # Copy in the toplevel error, notice, and fast_validation_disagreements sets.
         self.errors = self.ir.aconf.errors
         self.notices = self.ir.aconf.notices
+        self.fast_validation_disagreements = self.ir.aconf.fast_validation_disagreements
 
-        # First up, walk the list of Ambassador sources.
+        # Next up, walk the list of Ambassador sources.
         for key, rsrc in self.ir.aconf.sources.items():
             uqkey = key     # Unqualified key, e.g. ambassador.yaml
             fqkey = uqkey   # Fully-qualified key, e.g. ambassador.yaml.1
@@ -463,6 +473,8 @@ class Diagnostics:
 
             serialization = rsrc.get('serialization', None)
             if serialization:
+                if ambassador_element["kind"] == "Secret":
+                    serialization = "kind: Secret\ndata: (elided by Ambassador)\n"
                 ambassador_element['serialization'] = serialization
 
         # Next up, the Envoy elements.
@@ -497,13 +509,13 @@ class Diagnostics:
             self.add_ambassador_service(self.ir.tracing, 'TracingService (%s)' % self.ir.tracing.driver)
 
         self.ambassador_resolvers = []
-        used_resolvers: Dict[str, List[IRBaseMappingGroup]] = {}
+        used_resolvers: Dict[str, List[str]] = {}
 
         for group in self.groups.values():
             for mapping in group.mappings:
                 resolver_name = mapping.resolver
                 group_list = used_resolvers.setdefault(resolver_name, [])
-                group_list.append(group)
+                group_list.append(group.rkey)
 
         for name, resolver in sorted(self.ir.resolvers.items()):
             if name in used_resolvers:
@@ -527,7 +539,7 @@ class Diagnostics:
                 'type': type_name,
                 '_source': svc.location,
                 'name': url,
-                'cluster': cluster.name,
+                'cluster': cluster.envoy_name,
                 '_service_weight': svc_weight
             })
 
@@ -543,7 +555,7 @@ class Diagnostics:
             'kind': resolver.kind,
             '_source': resolver.location,
             'name': resolver.name,
-            'groups': [ g.as_dict() for g in group_list ]
+            'groups': group_list
         })
 
     @staticmethod
@@ -575,9 +587,45 @@ class Diagnostics:
             'envoy_elements': self.envoy_elements,
             'errors': self.errors,
             'notices': self.notices,
-            'groups': { key: value.as_dict() for key, value in self.groups.items() },
-            'clusters': { key: value.as_dict() for key, value in self.clusters.items() }
+            'fast_validation_disagreements': self.fast_validation_disagreements,
+            'groups': { key: self.flattened(value) for key, value in self.groups.items() },
+            # 'clusters': { key: value.as_dict() for key, value in self.clusters.items() },
+            'tlscontexts': [ x.as_dict() for x in self.ir.tls_contexts.values() ]
         }
+
+    def flattened(self, group: IRBaseMappingGroup) -> dict:
+        flattened = { k: v for k, v in group.as_dict().items() if k != 'mappings' }
+        flattened_mappings = []
+
+        for m in group['mappings']:
+            fm = {
+                "_active": m['_active'],
+                "_errored": m['_errored'],
+                "_rkey": m['rkey'],
+                "location": m['location'],
+                "name": m['name'],
+                "cluster_service": m.get('cluster', {}).get("service"),
+                "cluster_name": m.get('cluster', {}).get("envoy_name"),
+            }
+
+            if flattened['kind'] == 'IRHTTPMappingGroup':
+                fm['prefix'] = m.get('prefix')
+
+            rewrite = m.get('rewrite', None)
+
+            if rewrite:
+                fm['rewrite'] = rewrite
+
+            host = m.get('host', None)
+
+            if host:
+                fm['host'] = host
+
+            flattened_mappings.append(fm)
+
+        flattened['mappings'] = flattened_mappings
+
+        return flattened
 
     def _remember_source(self, src_key: str, dest_key: str) -> None:
         """
@@ -628,11 +676,9 @@ class Diagnostics:
         result = DiagResult(self, estat, request)
 
         for group in self.ir.ordered_groups():
+            # TCPMappings are currently handled elsewhere.
             if isinstance(group, IRHTTPMappingGroup):
                 result.include_httpgroup(group)
-            else:
-                # Can't happen yet.
-                self.logger.warning("group %s is not an HTTPMappingGroup, ignoring" % group.name)
 
         return result.as_dict()
 
@@ -661,11 +707,9 @@ class Diagnostics:
             # Yup, group ID.
             group = self.groups[key]
 
+            # TCPMappings are currently handled elsewhere.
             if isinstance(group, IRHTTPMappingGroup):
                 result.include_httpgroup(group)
-            else:
-                # Can't happen yet.
-                self.logger.warning("group %s is not an HTTPMappingGroup, ignoring" % group.name)
 
             found = True
         elif key in self.clusters:

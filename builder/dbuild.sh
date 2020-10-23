@@ -41,15 +41,15 @@ do
     esac
 done
 
-outfile=$(mktemp /tmp/docker-build.XXXXXX)
+outfile=$(mktemp -t docker-build.XXXXXX)
 if [ -z "$iidfile" ]; then
-    tmpiidfile=$(mktemp /tmp/docker-build-iid.XXXXXX)
+    tmpiidfile=$(mktemp -t docker-build-iid.XXXXXX)
     extra_args="--iidfile $tmpiidfile"
     iidfile=$tmpiidfile
 fi
 
 # start docker and sleep in a race
-docker build $extra_args "$@" > $outfile 2>&1 &
+docker build ${DBUILD_ARGS} $extra_args "$@" > $outfile 2>&1 &
 build_pid=$!
 sleep 3 &
 sleep_pid=$!

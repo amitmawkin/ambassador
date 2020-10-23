@@ -27,7 +27,7 @@ subjects:
     name: ambassador-consul-connect
     namespace: default
 ---
-apiVersion: ambassador/v1
+apiVersion: getambassador.io/v2
 kind: TLSContext
 metadata:
   name: ambassador-consul
@@ -73,8 +73,8 @@ spec:
       terminationGracePeriodSeconds: 0
       containers:
         - name: consul-connect-integration
-          image: quay.io/datawire/ambassador_pro:consul_connect_integration-$aproVersion$
-          imagePullPolicy: Always
+          image: docker.io/datawire/aes:$version$
+          command: [ "consul_connect_integration" ]
           resources:
             limits:
               cpu: 200m

@@ -20,12 +20,13 @@ class IRAuth (IRFilter):
                  rkey: str="ir.auth",
                  kind: str="IRAuth",
                  name: str="extauth",
+                 namespace: Optional[str] = None,
                  type: Optional[str] = "decoder",
                  **kwargs) -> None:
 
 
         super().__init__(
-            ir=ir, aconf=aconf, rkey=rkey, kind=kind, name=name,
+            ir=ir, aconf=aconf, rkey=rkey, kind=kind, name=name, namespace=namespace,
             cluster=None,
             timeout_ms=None,
             connect_timeout_ms=3000,
@@ -71,7 +72,7 @@ class IRAuth (IRFilter):
                               (service, weight, grpc, ctx_name, location))
 
             cluster = IRCluster(
-                ir=ir, aconf=aconf, location=location,
+                ir=ir, aconf=aconf, parent_ir_resource=self, location=location,
                 service=service,
                 host_rewrite=self.get('host_rewrite', False),
                 ctx_name=ctx_name,
@@ -95,6 +96,7 @@ class IRAuth (IRFilter):
             self.referenced_by(typecast(IRCluster, self.cluster))
 
     def _load_auth(self, module: Resource, ir: 'IR'):
+        self.namespace = module.get("namespace", self.namespace)
         if self.location == '--internal--':
             self.sourced_by(module)
 
@@ -130,6 +132,7 @@ class IRAuth (IRFilter):
         self["timeout_ms"] = module.get("timeout_ms", 5000)
         self["connect_timeout_ms"] = module.get("connect_timeout_ms", 3000)
         self["cluster_idle_timeout_ms"] = module.get("cluster_idle_timeout_ms", None)
+        self["add_auth_headers"] = module.get("add_auth_headers", {})
         self.__to_header_list('allowed_headers', module)
         self.__to_header_list('allowed_request_headers', module)
         self.__to_header_list('allowed_authorization_headers', module)
@@ -146,8 +149,8 @@ class IRAuth (IRFilter):
         if self["api_version"] == None:
             self.post_error(RichStatus.fromError("AuthService config requires apiVersion field"))
 
-        if self["api_version"] == "ambassador/v1" and self["proto"] == None:
-            self.post_error(RichStatus.fromError("AuthService v1 config requires proto field."))
+        if (self["api_version"] != "getambassador.io/v0") and (self["proto"] == None):
+            self.post_error(RichStatus.fromError("AuthService after v0 requires proto field."))
 
         if self.get("include_body") and self.get("allow_request_body"):
             self.post_error('AuthService ignoring allow_request_body since include_body is present')
@@ -160,29 +163,14 @@ class IRAuth (IRFilter):
             is_grpc = True if self["proto"] == "grpc" else False
             self.hosts[auth_service] = ( weight, is_grpc, module.get('tls', None), module.location)
 
-    # This method is only used by v1listener.
-    def config_dict(self):
-        config = {
-            "cluster": self.cluster.name
-        }
-
-        for key in [ 'allowed_headers', 'path_prefix', 'timeout_ms', 'weight', 'connect_timeout_ms', 'cluster_idle_timeout_ms' ]:
-            if self.get(key, None):
-                config[key] = self[key]
-
-        if self.get('allowed_headers', []):
-            config['allowed_headers'] = self.allowed_headers
-
-        return config
-
     def __to_header_list(self, list_name, module):
         headers = module.get(list_name, None)
 
         if headers:
             allowed_headers = self.get(list_name, [])
 
-            for hdr in headers:
-                if hdr not in allowed_headers:
+            for hdr in sorted(headers):
+                if hdr.lower() not in allowed_headers:
                     allowed_headers.append(hdr.lower())
 
             self[list_name] = allowed_headers

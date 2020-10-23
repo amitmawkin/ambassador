@@ -3,7 +3,7 @@ from typing import Any, ClassVar, Dict, List, Optional, Type, Union, TYPE_CHECKI
 
 from ..config import Config
 
-from .irbasemapping import IRBaseMapping
+from .irbasemapping import IRBaseMapping, normalize_service_name
 from .irbasemappinggroup import IRBaseMappingGroup
 from .irtcpmappinggroup import IRTCPMappingGroup
 
@@ -22,6 +22,7 @@ class IRTCPMapping (IRBaseMapping):
 
     AllowedKeys: ClassVar[Dict[str, bool]] = {
         "address": True,
+        "circuit_breakers": False,
         "enable_ipv4": True,
         "enable_ipv6": True,
         "host": True,
@@ -39,10 +40,14 @@ class IRTCPMapping (IRBaseMapping):
                  rkey: str,      # REQUIRED
                  name: str,      # REQUIRED
                  location: str,  # REQUIRED
+                 service: str,   # REQUIRED
+                 namespace: Optional[str] = None,
+                 metadata_labels: Optional[Dict[str, str]] = None,
 
-                 kind: str="IRMapping",
-                 apiVersion: str="ambassador/v1",   # Not a typo! See below.
+                 kind: str="IRTCPMapping",
+                 apiVersion: str="getambassador.io/v2",   # Not a typo! See below.
                  precedence: int=0,
+                 cluster_tag: Optional[str]=None,
                  **kwargs) -> None:
         # OK, this is a bit of a pain. We want to preserve the name and rkey and
         # such here, unlike most kinds of IRResource. So. Shallow copy the keys
@@ -50,11 +55,29 @@ class IRTCPMapping (IRBaseMapping):
 
         new_args = { x: kwargs[x] for x in kwargs.keys() if x in IRTCPMapping.AllowedKeys }
 
+        # XXX The resolver lookup code is duplicated from IRBaseMapping.setup --
+        # needs to be fixed after 1.6.1.
+        resolver_name = kwargs.get('resolver') or ir.ambassador_module.get('resolver', 'kubernetes-service')
+
+        assert(resolver_name)   # for mypy -- resolver_name cannot be None at this point
+        resolver = ir.get_resolver(resolver_name)
+
+        if resolver:
+            resolver_kind = resolver.kind
+        else:
+            # In IRBaseMapping.setup, we post an error if the resolver is unknown.
+            # Here, we just don't bother; we're only using it for service
+            # qualification.
+            resolver_kind = 'KubernetesBogusResolver'
+
+        service = normalize_service_name(ir, service, namespace, resolver_kind, rkey=rkey)
+        ir.logger.debug(f"TCPMapping {name} service normalized to {repr(service)}")
+
         # ...and then init the superclass.
         super().__init__(
-            ir=ir, aconf=aconf, rkey=rkey, location=location,
-            kind=kind, name=name, apiVersion=apiVersion,
-            precedence=precedence,
+            ir=ir, aconf=aconf, rkey=rkey, location=location, service=service,
+            kind=kind, name=name, namespace=namespace, metadata_labels=metadata_labels,
+            apiVersion=apiVersion, precedence=precedence, cluster_tag=cluster_tag,
             **new_args
         )
 

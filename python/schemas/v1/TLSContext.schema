@@ -4,10 +4,15 @@
 
     "type": "object",
     "properties": {
-        "apiVersion": { "enum": ["ambassador/v1"] },
+        "apiVersion": { "enum": [ "getambassador.io/v1" ] },
         "generation": { "type": "integer" },
         "kind": { "type": "string" },
         "name": { "type": "string" },
+        "namespace": { "type": "string" },
+        "metadata_labels": {
+            "type": "object",
+            "additionalProperties": { "type": [ "string", "boolean" ] }
+        },
         "ambassador_id": {
             "anyOf": [
                 { "type": "string" },
@@ -28,7 +33,8 @@
         "cipher_suites": { "type": "array", "items": { "type": "string" }  },
         "ecdh_curves": { "type": "array", "items": { "type": "string" }  },
         "secret_namespacing": { "type": "boolean" },
-        "redirect_cleartext_from": { "type": "integer" }
+        "redirect_cleartext_from": { "type": "integer" },
+        "sni": { "type": "string" }
     },
     "required": [ "apiVersion", "kind", "name" ],
     "additionalProperties": false

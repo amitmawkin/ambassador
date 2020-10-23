@@ -19,9 +19,17 @@ except AttributeError:
 from typing import Any, ClassVar, Dict, List, Optional, Sequence
 from typing import cast as typecast
 
-from kat.harness import abstract_test, sanitize, Name, Node, Test, Query
-from kat import manifests
+from kat.harness import abstract_test, sanitize, Name, Node, Test, Query, load_manifest
 from kat.utils import ShellCommand
+
+RBAC_CLUSTER_SCOPE = load_manifest("rbac_cluster_scope")
+RBAC_NAMESPACE_SCOPE = load_manifest("rbac_namespace_scope")
+AMBASSADOR = load_manifest("ambassador")
+BACKEND = load_manifest("backend")
+GRPC_ECHO_BACKEND = load_manifest("grpc_echo_backend")
+AUTH_BACKEND = load_manifest("auth_backend")
+GRPC_AUTH_BACKEND = load_manifest("grpc_auth_backend")
+GRPC_RLS_BACKEND = load_manifest("grpc_rls_backend")
 
 AMBASSADOR_LOCAL = """
 ---
@@ -40,7 +48,11 @@ def assert_default_errors(errors, include_ingress_errors=True):
         ["",
          "Ambassador could not find core CRD definitions. Please visit https://www.getambassador.io/reference/core/crds/ for more information. You can continue using Ambassador via Kubernetes annotations, any configuration via CRDs will be ignored..."],
         ["",
-         "Ambassador could not find Resolver type CRD definitions. Please visit https://www.getambassador.io/reference/core/crds/ for more information. You can continue using Ambassador via Kubernetes annotations, any configuration via CRDs will be ignored..."]
+         "Ambassador could not find Resolver type CRD definitions. Please visit https://www.getambassador.io/reference/core/crds/ for more information. You can continue using Ambassador via Kubernetes annotations, any configuration via CRDs will be ignored..."],
+        ["",
+         "Ambassador could not find the Host CRD definition. Please visit https://www.getambassador.io/reference/core/crds/ for more information. You can continue using Ambassador via Kubernetes annotations, any configuration via CRDs will be ignored..."],
+        ["",
+         "Ambassador could not find the LogService CRD definition. Please visit https://www.getambassador.io/reference/core/crds/ for more information. You can continue using Ambassador via Kubernetes annotations, any configuration via CRDs will be ignored..."]
     ]
 
     if include_ingress_errors:
@@ -51,7 +63,9 @@ def assert_default_errors(errors, include_ingress_errors=True):
         )
 
     number_of_default_errors = len(default_errors)
-    assert errors[:number_of_default_errors] == default_errors
+
+    if errors[:number_of_default_errors] != default_errors:
+        assert False, f"default error table mismatch: got\n{errors}"
 
     for error in errors[number_of_default_errors:]:
         assert 'found invalid port' in error[1], "Could not find 'found invalid port' in the error {}".format(error[1])
@@ -77,13 +91,33 @@ class AmbassadorTest(Test):
     name: Name
     path: Name
     extra_ports: Optional[List[int]] = None
-    debug_diagd: bool = False
+    debug_diagd: bool = True
     manifest_envs = ""
+    is_ambassador = True
+    allow_edge_stack_redirect = False
+    edge_stack_cleartext_host = True
 
     env = []
 
     def manifests(self) -> str:
-        rbac = manifests.RBAC_CLUSTER_SCOPE
+        rbac = RBAC_CLUSTER_SCOPE
+
+        self.manifest_envs += """
+    - name: POLL_EVERY_SECS
+      value: "0"
+"""
+
+        if os.environ.get('AMBASSADOR_FAST_VALIDATION', 'false').lower() == 'true':
+            self.manifest_envs += """
+    - name: AMBASSADOR_FAST_VALIDATION
+      value: "true"
+"""
+
+        if os.environ.get('AMBASSADOR_FAST_RECONFIGURE', 'false').lower() == 'true':
+            self.manifest_envs += """
+    - name: AMBASSADOR_FAST_RECONFIGURE
+      value: "true"
+"""
 
         if self.debug_diagd:
             self.manifest_envs += """
@@ -102,11 +136,16 @@ class AmbassadorTest(Test):
     - name: AMBASSADOR_SINGLE_NAMESPACE
       value: "yes"
 """
-            rbac = manifests.RBAC_NAMESPACE_SCOPE
+            rbac = RBAC_NAMESPACE_SCOPE
 
         if self.disable_endpoints:
             self.manifest_envs += """
     - name: AMBASSADOR_DISABLE_ENDPOINTS
+      value: "yes"
+"""
+        if not self.allow_edge_stack_redirect:
+            self.manifest_envs += """
+    - name: AMBASSADOR_NO_TLS_REDIRECT
       value: "yes"
 """
 
@@ -124,7 +163,7 @@ class AmbassadorTest(Test):
         if DEV:
             return self.format(rbac + AMBASSADOR_LOCAL, extra_ports=eports)
         else:
-            return self.format(rbac + manifests.AMBASSADOR,
+            return self.format(rbac + AMBASSADOR,
                                image=os.environ["AMBASSADOR_DOCKER_IMAGE"], envs=self.manifest_envs, extra_ports=eports, capabilities_block = "")
 
     # Will tear this out of the harness shortly
@@ -230,6 +269,8 @@ class AmbassadorTest(Test):
                  "KUBERNETES_SERVICE_PORT=443",
                  "AMBASSADOR_SNAPSHOT_COUNT=1",
                  "AMBASSADOR_CONFIG_BASE_DIR=/tmp/ambassador",
+                 "POLL_EVERY_SECS=0",
+                 "AMBASSADOR_UPDATE_MAPPING_STATUS=false",
                  "AMBASSADOR_ID=%s" % self.ambassador_id]
 
         if self.namespace:
@@ -310,26 +351,6 @@ class AmbassadorTest(Test):
 
 
 @abstract_test
-class IsolatedServiceType(Node):
-
-    path: Name
-
-    def __init__(self, service_manifests: str=None, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self._manifests = service_manifests or manifests.ISOLATED_BACKEND
-
-    def config(self):
-        yield from ()
-
-    def manifests(self):
-        return self.format(self._manifests)
-
-    def requirements(self):
-        yield ("url", Query("http://%s" % self.path.fqdn))
-        yield ("url", Query("https://%s" % self.path.fqdn))
-
-
-@abstract_test
 class ServiceType(Node):
 
     path: Name
@@ -368,7 +389,7 @@ class ServiceTypeGrpc(Node):
 
     def __init__(self, service_manifests: str=None, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self._manifests = service_manifests or manifests.BACKEND
+        self._manifests = service_manifests or BACKEND
 
     def config(self):
         yield from ()
@@ -392,7 +413,7 @@ class EGRPC(ServiceType):
     skip_variant: ClassVar[bool] = True
 
     def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, service_manifests=manifests.GRPC_ECHO_BACKEND, **kwargs)
+        super().__init__(*args, service_manifests=GRPC_ECHO_BACKEND, **kwargs)
 
     def requirements(self):
         yield ("url", Query("http://%s/echo.EchoService/Echo" % self.path.fqdn,
@@ -405,14 +426,23 @@ class AHTTP(ServiceType):
     skip_variant: ClassVar[bool] = True
 
     def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, service_manifests=manifests.AUTH_BACKEND, **kwargs)
+        super().__init__(*args, service_manifests=AUTH_BACKEND, **kwargs)
 
 
 class AGRPC(ServiceType):
     skip_variant: ClassVar[bool] = True
 
     def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, service_manifests=manifests.GRPC_AUTH_BACKEND, **kwargs)
+        super().__init__(*args, service_manifests=GRPC_AUTH_BACKEND, **kwargs)
+
+    def requirements(self):
+        yield ("pod", self.path.k8s)
+
+class RLSGRPC(ServiceType):
+    skip_variant: ClassVar[bool] = True
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, service_manifests=GRPC_RLS_BACKEND, **kwargs)
 
     def requirements(self):
         yield ("pod", self.path.k8s)
@@ -424,10 +454,13 @@ class MappingTest(Test):
     options: Sequence['OptionTest']
     parent: AmbassadorTest
 
+    no_local_mode = True
+    skip_local_instead_of_xfail = "Plain (MappingTest)"
+
     def init(self, target: ServiceType, options=()) -> None:
         self.target = target
         self.options = list(options)
-
+        self.is_ambassador = True
 
 @abstract_test
 class OptionTest(Test):
@@ -435,6 +468,9 @@ class OptionTest(Test):
     VALUES: ClassVar[Any] = None
     value: Any
     parent: Test
+
+    no_local_mode = True
+    skip_local_instead_of_xfail = "Plain (OptionTests)"
 
     @classmethod
     def variants(cls):

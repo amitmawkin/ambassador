@@ -5,6 +5,8 @@ from ..constants import Constants
 from ..config import Config
 
 from .irresource import IRResource
+from .iripallowdeny import IRIPAllowDeny
+from .irbasemapping import IRBaseMapping
 from .irhttpmapping import IRHTTPMapping
 from .irtls import IRAmbassadorTLS
 from .irtlscontext import IRTLSContext
@@ -22,42 +24,50 @@ class IRAmbassador (IRResource):
 
     # All the AModTransparentKeys are copied from the incoming Ambassador resource
     # into the IRAmbassador object partway through IRAmbassador.finalize().
+    #
+    # PLEASE KEEP THIS LIST SORTED.
+
     AModTransparentKeys: ClassVar = [
         'add_linkerd_headers',
         'admin_port',
         'auth_enabled',
         'circuit_breakers',
+        'cluster_idle_timeout_ms',
+        'debug_mode',
+        # Do not include defaults, that's handled manually in setup.
         'default_label_domain',
         'default_labels',
-        # Do not include defaults, that's handled manually in setup.
-        'diag_port',
         'diagnostics',
         'enable_http10',
-        'enable_ipv6',
-        'envoy_log_type',
-        'envoy_log_path',
-        'envoy_log_format',
         'enable_ipv4',
-        'cluster_idle_timeout_ms',
+        'enable_ipv6',
+        'envoy_log_format',
+        'envoy_log_path',
+        'envoy_log_type',
+        # Do not include envoy_validation_timeout; we let finalize() type-check it.
+        # Do not include ip_allow or ip_deny; we let finalize() type-check them.
+        'keepalive',
+        'listener_idle_timeout_ms',
         'liveness_probe',
         'load_balancer',
-        'keepalive',
+        'preserve_external_request_id'
+        'proper_case',
+        'prune_unreachable_routes',
         'readiness_probe',
         'regex_max_size',
         'regex_type',
         'resolver',
-        'debug_mode',
         'server_name',
         'service_port',
         'statsd',
+        'use_ambassador_namespace_for_service_resolution',
         'use_proxy_proto',
         'use_remote_address',
         'x_forwarded_proto_redirect',
-        'xff_num_trusted_hops'
+        'xff_num_trusted_hops',
     ]
 
     service_port: int
-    diag_port: int
     default_label_domain: str
 
     # Set up the default probes and such.
@@ -76,6 +86,14 @@ class IRAmbassador (IRResource):
         "rewrite": "/ambassador/v0/",
     }
 
+    # Set up the default Envoy validation timeout. This is deliberately chosen to be very large
+    # because the consequences of this timeout tripping are very bad. Ambassador basically ceases
+    # to function. It is far better to slow down as our configurations grow and give users a
+    # leading indicator that there is a scaling issue that needs to be dealt with than to
+    # suddenly and mysteriously stop functioning the day their configuration happens to become
+    # large enough to exceed this threshold.
+    default_validation_timeout: ClassVar[int] = 60
+
     def __init__(self, ir: 'IR', aconf: Config,
                  rkey: str="ir.ambassador",
                  kind: str="IRAmbassador",
@@ -88,28 +106,34 @@ class IRAmbassador (IRResource):
             ir=ir, aconf=aconf, rkey=rkey, kind=kind, name=name,
             service_port=Constants.SERVICE_PORT_HTTP,
             admin_port=Constants.ADMIN_PORT,
-            diag_port=Constants.DIAG_PORT,
             auth_enabled=None,
             enable_ipv6=False,
             envoy_log_type="text",
             envoy_log_path="/dev/fd/1",
             envoy_log_format=None,
+            envoy_validation_timeout=IRAmbassador.default_validation_timeout,
             enable_ipv4=True,
+            listener_idle_timeout_ms=None,
             liveness_probe={"enabled": True},
             readiness_probe={"enabled": True},
             diagnostics={"enabled": True},
             use_proxy_proto=False,
             enable_http10=False,
+            proper_case=False,
+            prune_unreachable_routes=False,
             use_remote_address=use_remote_address,
             x_forwarded_proto_redirect=False,
             load_balancer=None,
             circuit_breakers=None,
             xff_num_trusted_hops=0,
+            use_ambassador_namespace_for_service_resolution=False,
             server_name="envoy",
             debug_mode=False,
+            preserve_external_request_id=False,
             **kwargs
         )
 
+        self.ip_allow_deny: Optional[IRIPAllowDeny] = None
         self._finalized = False
 
     def setup(self, ir: 'IR', aconf: Config) -> bool:
@@ -156,10 +180,19 @@ class IRAmbassador (IRResource):
         # get handled manually below.
         amod = aconf.get_module("ambassador")
 
-        for key in IRAmbassador.AModTransparentKeys:
-            if amod and (key in amod):
-                # Yes. It overrides the default.
-                self[key] = amod[key]
+        if amod:
+            for key in IRAmbassador.AModTransparentKeys:
+                if key in amod:
+                    # Override the default here.
+                    self[key] = amod[key]
+
+            # If we have an envoy_validation_timeout...
+            if 'envoy_validation_timeout' in amod:
+                # ...then set our timeout from it.
+                try:
+                    self.envoy_validation_timeout = int(amod['envoy_validation_timeout'])
+                except ValueError:
+                    self.post_error("envoy_validation_timeout must be an integer number of seconds")
 
         # If we don't have a default label domain, force it to 'ambassador'.
         if not self.get('default_label_domain'):
@@ -171,8 +204,7 @@ class IRAmbassador (IRResource):
             self.default_labels: Dict[str, Any] = {}
 
         # Next up: diag port & services.
-        diag_port = aconf.module_lookup('ambassador', 'diag_port', Constants.DIAG_PORT)
-        diag_service = "127.0.0.1:%d" % diag_port
+        diag_service = "127.0.0.1:%d" % Constants.DIAG_PORT
 
         for name, cur, dflt in [
             ("liveness",    self.liveness_probe,  IRAmbassador.default_liveness_probe),
@@ -201,6 +233,43 @@ class IRAmbassador (IRResource):
             self.grpc_web = IRFilter(ir=ir, aconf=aconf, kind='ir.grpc_web', name='grpc_web', config=dict())
             self.grpc_web.sourced_by(amod)
             ir.save_filter(self.grpc_web)
+
+        if amod and ('grpc_stats' in amod):
+            grpc_stats = amod.grpc_stats
+
+            # default config with safe values
+            config = {
+                'individual_method_stats_allowlist': {
+                    'services': []
+                },
+                'stats_for_all_methods': False,
+                'enable_upstream_stats': False
+            }
+
+            if ('services' in grpc_stats):
+                config['individual_method_stats_allowlist'] = {
+                    'services': grpc_stats['services']
+                }
+                # remove stats_for_all_methods key from config. only one of individual_method_stats_allowlist or
+                # stats_for_all_methods can be set
+                config.pop('stats_for_all_methods')
+
+            # if 'services' is present, ignore 'all_methods'
+            if ('all_methods' in grpc_stats) and ('services' not in grpc_stats):
+                config['stats_for_all_methods'] = bool(grpc_stats['all_methods'])
+                # remove individual_method_stats_allowlist key from config. only one of individual_method_stats_allowlist or
+                # stats_for_all_methods can be set
+                config.pop('individual_method_stats_allowlist')
+
+            if ('upstream_stats' in grpc_stats):
+                config['enable_upstream_stats'] = bool(grpc_stats['upstream_stats'])
+
+            self.grpc_stats = IRFilter(ir=ir, aconf=aconf,
+                                       kind='ir.grpc_stats',
+                                       name='grpc_stats',
+                                       config=config)
+            self.grpc_stats.sourced_by(amod)
+            ir.save_filter(self.grpc_stats)
 
         if amod and ('lua_scripts' in amod):
             self.lua_scripts = IRFilter(ir=ir, aconf=aconf, kind='ir.lua_scripts', name='lua_scripts',
@@ -246,15 +315,47 @@ class IRAmbassador (IRResource):
             else:
                 return False
 
+        if amod:
+            if 'ip_allow' in amod:
+                self.handle_ip_allow_deny(allow=True, principals=amod.ip_allow)
+
+            if 'ip_deny' in amod:
+                self.handle_ip_allow_deny(allow=False, principals=amod.ip_deny)
+
+            if self.ip_allow_deny is not None:
+                ir.save_filter(self.ip_allow_deny)
+
+                # Clear this so it doesn't get duplicated when we dump the
+                # Ambassador module.
+                self.ip_allow_deny = None
+
         if self.get('load_balancer', None) is not None:
             if not IRHTTPMapping.validate_load_balancer(self['load_balancer']):
                 self.post_error("Invalid load_balancer specified: {}".format(self['load_balancer']))
                 return False
 
         if self.get('circuit_breakers', None) is not None:
-            if not IRHTTPMapping.validate_circuit_breakers(self.ir, self['circuit_breakers']):
+            if not IRBaseMapping.validate_circuit_breakers(self.ir, self['circuit_breakers']):
                 self.post_error("Invalid circuit_breakers specified: {}".format(self['circuit_breakers']))
                 return False
+
+        if self.get('envoy_log_type') == 'text':
+            if self.get('envoy_log_format', None) is not None and not isinstance(self.get('envoy_log_format'), str):
+                self.post_error(
+                    "envoy_log_type 'text' requires a string in envoy_log_format: {}, invalidating...".format(
+                        self.get('envoy_log_format')))
+                self['envoy_log_format'] = ""
+                return False
+        elif self.get('envoy_log_type') == 'json':
+            if self.get('envoy_log_format', None) is not None and not isinstance(self.get('envoy_log_format'), dict):
+                self.post_error(
+                    "envoy_log_type 'json' requires a dictionary in envoy_log_format: {}, invalidating...".format(
+                        self.get('envoy_log_format')))
+                self['envoy_log_format'] = {}
+                return False
+        else:
+            self.post_error("Invalid log_type specified: {}. Supported: json, text".format(self.get('envoy_log_type')))
+            return False
 
         return True
 
@@ -272,6 +373,36 @@ class IRAmbassador (IRResource):
                 mapping.referenced_by(self)
                 ir.add_mapping(aconf, mapping)
 
+        if ir.edge_stack_allowed:
+            if self.diagnostics and self.diagnostics.get("enabled", False):
+                ir.logger.debug("adding mappings for Edge Policy Console")
+                edge_stack_response_header = {"x-content-type-options": "nosniff"}
+                mapping = IRHTTPMapping(ir, aconf, rkey=self.rkey, location=self.location,
+                                        name="edgestack-direct-mapping",
+                                        metadata_labels={"ambassador_diag_class": "private"},
+                                        prefix="/edge_stack/",
+                                        rewrite="/edge_stack_ui/edge_stack/",
+                                        service="127.0.0.1:8500",
+                                        precedence=1000000,
+                                        timeout_ms=60000,
+                                        add_response_headers=edge_stack_response_header)
+                mapping.referenced_by(self)
+                ir.add_mapping(aconf, mapping)
+
+                mapping = IRHTTPMapping(ir, aconf, rkey=self.rkey, location=self.location,
+                                        name="edgestack-fallback-mapping",
+                                        metadata_labels={"ambassador_diag_class": "private"},
+                                        prefix="^/$", prefix_regex=True,
+                                        rewrite="/edge_stack_ui/",
+                                        service="127.0.0.1:8500",
+                                        precedence=-1000000,
+                                        timeout_ms=60000,
+                                        add_response_headers=edge_stack_response_header)
+                mapping.referenced_by(self)
+                ir.add_mapping(aconf, mapping)
+            else:
+                ir.logger.debug("diagnostics disabled, skipping mapping for Edge Policy Console")
+
     def get_default_label_domain(self) -> str:
         return self.default_label_domain
 
@@ -285,10 +416,28 @@ class IRAmbassador (IRResource):
 
         return domain_info.get('defaults')
 
-    def get_default_label_prefix(self, domain: Optional[str]=None) -> Optional[List]:
-        if not domain:
-            domain = self.get_default_label_domain()
+    def handle_ip_allow_deny(self, allow: bool, principals: List[str]) -> None:
+        """
+        Handle IP Allow/Deny. "allow" here states whether this is an
+        allow rule (True) or a deny rule (False); "principals" is a list
+        of IP addresses or CIDR ranges to allow or deny.
 
-        domain_info = self.default_labels.get(domain, {})
-        return domain_info.get('label_prefix')
+        Only one of ip_allow or ip_deny can be set, so it's an error to
+        call this twice (even if "allow" is the same for both calls).
+
+        :param allow: True for an ALLOW rule, False for a DENY rule
+        :param principals: list of IP addresses or CIDR ranges to match
+        """
+
+        if self.get('ip_allow_deny') is not None:
+            self.post_error("ip_allow and ip_deny may not both be set")
+            return
+
+        ipa = IRIPAllowDeny(self.ir, self.ir.aconf, rkey=self.rkey,
+                            parent=self,
+                            action="ALLOW" if allow else "DENY",
+                            principals=principals)
+
+        if ipa:
+            self['ip_allow_deny'] = ipa
 

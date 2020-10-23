@@ -15,7 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/gogo/protobuf/types"
+	"github.com/golang/protobuf/ptypes"
 )
 
 // ensure the imports are used
@@ -30,8 +30,11 @@ var (
 	_ = time.Duration(0)
 	_ = (*url.URL)(nil)
 	_ = (*mail.Address)(nil)
-	_ = types.DynamicAny{}
+	_ = ptypes.DynamicAny{}
 )
+
+// define the regex for a UUID once up-front
+var _health_check_uuidPattern = regexp.MustCompile("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 // Validate checks the field values on HealthCheck with the rules defined in
 // the proto definition for this message. If any rules are violated, an error
@@ -48,52 +51,52 @@ func (m *HealthCheck) Validate() error {
 		}
 	}
 
-	{
-		tmp := m.GetPassThroughMode()
+	if v, ok := interface{}(m.GetPassThroughMode()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return HealthCheckValidationError{
+				field:  "PassThroughMode",
+				reason: "embedded message failed validation",
+				cause:  err,
+			}
+		}
+	}
 
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
+	if v, ok := interface{}(m.GetCacheTime()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return HealthCheckValidationError{
+				field:  "CacheTime",
+				reason: "embedded message failed validation",
+				cause:  err,
+			}
+		}
+	}
 
+	for key, val := range m.GetClusterMinHealthyPercentages() {
+		_ = val
+
+		// no validation rules for ClusterMinHealthyPercentages[key]
+
+		if v, ok := interface{}(val).(interface{ Validate() error }); ok {
 			if err := v.Validate(); err != nil {
 				return HealthCheckValidationError{
-					field:  "PassThroughMode",
+					field:  fmt.Sprintf("ClusterMinHealthyPercentages[%v]", key),
 					reason: "embedded message failed validation",
 					cause:  err,
 				}
 			}
 		}
+
 	}
-
-	{
-		tmp := m.GetCacheTime()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return HealthCheckValidationError{
-					field:  "CacheTime",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
-			}
-		}
-	}
-
-	// no validation rules for ClusterMinHealthyPercentages
 
 	for idx, item := range m.GetHeaders() {
 		_, _ = idx, item
 
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return HealthCheckValidationError{
-						field:  fmt.Sprintf("Headers[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return HealthCheckValidationError{
+					field:  fmt.Sprintf("Headers[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}

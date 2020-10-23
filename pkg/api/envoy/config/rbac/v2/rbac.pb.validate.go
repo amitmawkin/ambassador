@@ -15,7 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/gogo/protobuf/types"
+	"github.com/golang/protobuf/ptypes"
 )
 
 // ensure the imports are used
@@ -30,8 +30,11 @@ var (
 	_ = time.Duration(0)
 	_ = (*url.URL)(nil)
 	_ = (*mail.Address)(nil)
-	_ = types.DynamicAny{}
+	_ = ptypes.DynamicAny{}
 )
+
+// define the regex for a UUID once up-front
+var _rbac_uuidPattern = regexp.MustCompile("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 // Validate checks the field values on RBAC with the rules defined in the proto
 // definition for this message. If any rules are violated, an error is returned.
@@ -42,7 +45,22 @@ func (m *RBAC) Validate() error {
 
 	// no validation rules for Action
 
-	// no validation rules for Policies
+	for key, val := range m.GetPolicies() {
+		_ = val
+
+		// no validation rules for Policies[key]
+
+		if v, ok := interface{}(val).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return RBACValidationError{
+					field:  fmt.Sprintf("Policies[%v]", key),
+					reason: "embedded message failed validation",
+					cause:  err,
+				}
+			}
+		}
+
+	}
 
 	return nil
 }
@@ -118,17 +136,12 @@ func (m *Policy) Validate() error {
 	for idx, item := range m.GetPermissions() {
 		_, _ = idx, item
 
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return PolicyValidationError{
-						field:  fmt.Sprintf("Permissions[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return PolicyValidationError{
+					field:  fmt.Sprintf("Permissions[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
@@ -145,34 +158,24 @@ func (m *Policy) Validate() error {
 	for idx, item := range m.GetPrincipals() {
 		_, _ = idx, item
 
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return PolicyValidationError{
-						field:  fmt.Sprintf("Principals[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return PolicyValidationError{
+					field:  fmt.Sprintf("Principals[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
 
 	}
 
-	{
-		tmp := m.GetCondition()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return PolicyValidationError{
-					field:  "Condition",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetCondition()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return PolicyValidationError{
+				field:  "Condition",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
@@ -245,34 +248,24 @@ func (m *Permission) Validate() error {
 
 	case *Permission_AndRules:
 
-		{
-			tmp := m.GetAndRules()
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return PermissionValidationError{
-						field:  "AndRules",
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(m.GetAndRules()).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return PermissionValidationError{
+					field:  "AndRules",
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
 
 	case *Permission_OrRules:
 
-		{
-			tmp := m.GetOrRules()
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return PermissionValidationError{
-						field:  "OrRules",
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(m.GetOrRules()).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return PermissionValidationError{
+					field:  "OrRules",
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
@@ -288,34 +281,36 @@ func (m *Permission) Validate() error {
 
 	case *Permission_Header:
 
-		{
-			tmp := m.GetHeader()
+		if v, ok := interface{}(m.GetHeader()).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return PermissionValidationError{
+					field:  "Header",
+					reason: "embedded message failed validation",
+					cause:  err,
+				}
+			}
+		}
 
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
+	case *Permission_UrlPath:
 
-				if err := v.Validate(); err != nil {
-					return PermissionValidationError{
-						field:  "Header",
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(m.GetUrlPath()).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return PermissionValidationError{
+					field:  "UrlPath",
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
 
 	case *Permission_DestinationIp:
 
-		{
-			tmp := m.GetDestinationIp()
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return PermissionValidationError{
-						field:  "DestinationIp",
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(m.GetDestinationIp()).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return PermissionValidationError{
+					field:  "DestinationIp",
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
@@ -331,51 +326,36 @@ func (m *Permission) Validate() error {
 
 	case *Permission_Metadata:
 
-		{
-			tmp := m.GetMetadata()
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return PermissionValidationError{
-						field:  "Metadata",
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(m.GetMetadata()).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return PermissionValidationError{
+					field:  "Metadata",
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
 
 	case *Permission_NotRule:
 
-		{
-			tmp := m.GetNotRule()
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return PermissionValidationError{
-						field:  "NotRule",
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(m.GetNotRule()).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return PermissionValidationError{
+					field:  "NotRule",
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
 
 	case *Permission_RequestedServerName:
 
-		{
-			tmp := m.GetRequestedServerName()
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return PermissionValidationError{
-						field:  "RequestedServerName",
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(m.GetRequestedServerName()).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return PermissionValidationError{
+					field:  "RequestedServerName",
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
@@ -456,34 +436,24 @@ func (m *Principal) Validate() error {
 
 	case *Principal_AndIds:
 
-		{
-			tmp := m.GetAndIds()
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return PrincipalValidationError{
-						field:  "AndIds",
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(m.GetAndIds()).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return PrincipalValidationError{
+					field:  "AndIds",
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
 
 	case *Principal_OrIds:
 
-		{
-			tmp := m.GetOrIds()
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return PrincipalValidationError{
-						field:  "OrIds",
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(m.GetOrIds()).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return PrincipalValidationError{
+					field:  "OrIds",
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
@@ -499,85 +469,96 @@ func (m *Principal) Validate() error {
 
 	case *Principal_Authenticated_:
 
-		{
-			tmp := m.GetAuthenticated()
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return PrincipalValidationError{
-						field:  "Authenticated",
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(m.GetAuthenticated()).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return PrincipalValidationError{
+					field:  "Authenticated",
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
 
 	case *Principal_SourceIp:
 
-		{
-			tmp := m.GetSourceIp()
+		if v, ok := interface{}(m.GetSourceIp()).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return PrincipalValidationError{
+					field:  "SourceIp",
+					reason: "embedded message failed validation",
+					cause:  err,
+				}
+			}
+		}
 
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
+	case *Principal_DirectRemoteIp:
 
-				if err := v.Validate(); err != nil {
-					return PrincipalValidationError{
-						field:  "SourceIp",
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(m.GetDirectRemoteIp()).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return PrincipalValidationError{
+					field:  "DirectRemoteIp",
+					reason: "embedded message failed validation",
+					cause:  err,
+				}
+			}
+		}
+
+	case *Principal_RemoteIp:
+
+		if v, ok := interface{}(m.GetRemoteIp()).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return PrincipalValidationError{
+					field:  "RemoteIp",
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
 
 	case *Principal_Header:
 
-		{
-			tmp := m.GetHeader()
+		if v, ok := interface{}(m.GetHeader()).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return PrincipalValidationError{
+					field:  "Header",
+					reason: "embedded message failed validation",
+					cause:  err,
+				}
+			}
+		}
 
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
+	case *Principal_UrlPath:
 
-				if err := v.Validate(); err != nil {
-					return PrincipalValidationError{
-						field:  "Header",
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(m.GetUrlPath()).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return PrincipalValidationError{
+					field:  "UrlPath",
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
 
 	case *Principal_Metadata:
 
-		{
-			tmp := m.GetMetadata()
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return PrincipalValidationError{
-						field:  "Metadata",
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(m.GetMetadata()).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return PrincipalValidationError{
+					field:  "Metadata",
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
 
 	case *Principal_NotId:
 
-		{
-			tmp := m.GetNotId()
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return PrincipalValidationError{
-						field:  "NotId",
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(m.GetNotId()).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return PrincipalValidationError{
+					field:  "NotId",
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
@@ -665,17 +646,12 @@ func (m *Permission_Set) Validate() error {
 	for idx, item := range m.GetRules() {
 		_, _ = idx, item
 
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return Permission_SetValidationError{
-						field:  fmt.Sprintf("Rules[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return Permission_SetValidationError{
+					field:  fmt.Sprintf("Rules[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
@@ -757,17 +733,12 @@ func (m *Principal_Set) Validate() error {
 	for idx, item := range m.GetIds() {
 		_, _ = idx, item
 
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return Principal_SetValidationError{
-						field:  fmt.Sprintf("Ids[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return Principal_SetValidationError{
+					field:  fmt.Sprintf("Ids[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
@@ -839,17 +810,12 @@ func (m *Principal_Authenticated) Validate() error {
 		return nil
 	}
 
-	{
-		tmp := m.GetPrincipalName()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return Principal_AuthenticatedValidationError{
-					field:  "PrincipalName",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetPrincipalName()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return Principal_AuthenticatedValidationError{
+				field:  "PrincipalName",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}

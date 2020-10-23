@@ -13,9 +13,11 @@
 # limitations under the License
 import socket
 
-from typing import Any, ClassVar, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, ClassVar, Dict, Iterable, List, Optional, Tuple, Union
 from typing import cast as typecast
 
+import collections
+import importlib
 import json
 import logging
 import os
@@ -24,6 +26,7 @@ import jsonschema
 
 from multi import multi
 from pkg_resources import Requirement, resource_filename
+from google.protobuf import json_format
 
 from ..utils import RichStatus
 
@@ -42,6 +45,13 @@ from .acmapping import ACMapping
 # StringOrList is either a string or a list of strings.
 StringOrList = Union[str, List[str]]
 
+# Validator is a callable that accepts an ACResource and validates it. The
+# return value is a RichStatus.
+#
+# The assumption here is that Config.get_validator() will return something
+# like a lambda that's tailored to the apiVersion and kind of the resource.
+Validator = Callable[[ACResource], RichStatus]
+
 
 class Config:
     # CLASS VARIABLES
@@ -49,11 +59,14 @@ class Config:
     ambassador_id: ClassVar[str] = os.environ.get('AMBASSADOR_ID', 'default')
     ambassador_namespace: ClassVar[str] = os.environ.get('AMBASSADOR_NAMESPACE', 'default')
     single_namespace: ClassVar[bool] = bool(os.environ.get('AMBASSADOR_SINGLE_NAMESPACE'))
+    certs_single_namespace: ClassVar[bool] = bool(os.environ.get('AMBASSADOR_CERTS_SINGLE_NAMESPACE', os.environ.get('AMBASSADOR_SINGLE_NAMESPACE')))
     enable_endpoints: ClassVar[bool] = not bool(os.environ.get('AMBASSADOR_DISABLE_ENDPOINTS'))
+    fast_validation: ClassVar[bool] = bool(os.environ.get('AMBASSADOR_FAST_VALIDATION'))
 
     StorageByKind: ClassVar[Dict[str, str]] = {
         'authservice': "auth_configs",
         'consulresolver': "resolvers",
+        'host': "hosts",
         'mapping': "mappings",
         'kubernetesendpointresolver': "resolvers",
         'kubernetesserviceresolver': "resolvers",
@@ -63,8 +76,6 @@ class Config:
         'tracingservice': "tracing_configs",
         'logservice': "log_services",
     }
-
-    KnativeResources = { 'ClusterIngress', 'KnativeIngress' }
 
     SupportedVersions: ClassVar[Dict[str, str]] = {
         "v0": "is deprecated, consider upgrading",
@@ -86,20 +97,25 @@ class Config:
     current_resource: Optional[ACResource] = None
     helm_chart: Optional[str]
 
-    # XXX flat wrong
-    schemas: Dict[str, dict]
+    validators: Dict[str, Validator]
     config: Dict[str, Dict[str, ACResource]]
 
     breakers: Dict[str, ACResource]
     outliers: Dict[str, ACResource]
 
+    counters: Dict[str, int]
+
     # rkey => ACResource
     sources: Dict[str, ACResource]
 
-    errors: Dict[str, List[dict]]
-    notices: Dict[str, List[str]]
+    errors: Dict[str, List[dict]]           # errors to post to the UI
+    notices: Dict[str, List[str]]           # notices to post to the UI
     fatal_errors: int
     object_errors: int
+
+    # fast_validation_disagreements tracks places where watt says a resource
+    # is invalid, but Python says it's OK.
+    fast_validation_disagreements: Dict[str, List[str]]
 
     def __init__(self, schema_dir_path: Optional[str]=None) -> None:
 
@@ -130,7 +146,10 @@ class Config:
         self.schema_dir_path = schema_dir_path
 
         self.logger.debug("SCHEMA DIR    %s" % os.path.abspath(self.schema_dir_path))
-        self.k8s_status_updates: Dict[str, Tuple] = {}
+        self.k8s_status_updates: Dict[str, Tuple[str, str, Optional[Dict[str, Any]]]] = {}  # Tuple is (name, namespace, status_json)
+        self.k8s_ingresses: Dict[str, Any] = {}
+        self.k8s_ingress_classes: Dict[str, Any] = {}
+        self.pod_labels: Dict[str, str] = {}
         self._reset()
 
     def _reset(self) -> None:
@@ -143,11 +162,13 @@ class Config:
         self.current_resource = None
         self.helm_chart = None
 
-        self.schemas = {}
+        self.validators = {}
         self.config = {}
 
         self.breakers = {}
         self.outliers = {}
+
+        self.counters = collections.defaultdict(lambda: 0)
 
         self.sources = {}
 
@@ -159,6 +180,8 @@ class Config:
         self.notices = {}
         self.fatal_errors = 0
         self.object_errors = 0
+
+        self.fast_validation_disagreements = {}
 
         # Build up the Ambassador node name.
         #
@@ -183,6 +206,7 @@ class Config:
         od: Dict[str, Any] = {
             '_errors': self.errors,
             '_notices': self.notices,
+            '_fast_validation_disagreements': self.fast_validation_disagreements,
             '_sources': {}
         }
 
@@ -208,22 +232,28 @@ class Config:
     def as_json(self):
         return json.dumps(self.as_dict(), sort_keys=True, indent=4)
 
-    def ambassador_id_required(self, resource_kind: str) -> bool:
-        if resource_kind in self.KnativeResources:
-            return False
-
-        return True
-
     # Often good_ambassador_id will be passed an ACResource, but sometimes
     # just a plain old dict.
     def good_ambassador_id(self, resource: dict):
-        resource_kind = resource.get('kind', '').lower()
-        if not self.ambassador_id_required(resource_kind):
-            self.logger.debug(f"Resource: {resource_kind} does not require an Ambassador ID")
-            return True
+        resource_kind = resource.get('kind', '')
 
         # Is an ambassador_id present in this object?
-        allowed_ids: StringOrList = resource.get('ambassador_id', 'default')
+        #
+        # NOTE WELL: when we update the status of a Host (or a Mapping?) then reserialization
+        # can cause the `ambassador_id` element to turn into an `ambassadorId` element. So
+        # treat those as synonymous.
+        allowed_ids: StringOrList = resource.get('ambassadorId', None)
+
+        if allowed_ids is None:
+            allowed_ids = resource.get('ambassador_id', 'default')
+
+        # If we find the array [ '_automatic_' ] then allow it, so that hardcoded resources
+        # can have a useful effect. This is mostly for init-config, but could be used for
+        # other things, too.
+
+        if allowed_ids == [ "_automatic_" ]:
+            self.logger.debug(f"ambassador_id {allowed_ids} always accepted")
+            return True
 
         if allowed_ids:
             # Make sure it's a list. Yes, this is Draconian,
@@ -235,9 +265,17 @@ class Config:
             if Config.ambassador_id in allowed_ids:
                 return True
             else:
-                self.logger.debug(f"Ambassador ID {Config.ambassador_id} does not exist in allowed IDs {allowed_ids}")
-                self.logger.debug(resource)
+                rkey = resource.get('rkey', '-anonymous-yaml-')
+                name = resource.get('name', '-no-name-')
+
+                self.logger.debug(f"{rkey}: {resource_kind} {name} has IDs {allowed_ids}, no match with {Config.ambassador_id}")
                 return False
+
+    def incr_count(self, key: str) -> None:
+        self.counters[key] += 1
+
+    def get_count(self, key: str) -> int:
+        return self.counters.get(key, 0)
 
     def save_source(self, resource: ACResource) -> None:
         """
@@ -250,6 +288,8 @@ class Config:
         Loads all of a set of ACResources. It is the caller's responsibility to arrange for
         the set of ACResources to be sorted in some way that makes sense.
         """
+
+        self.logger.debug(f"Loading config; fast validation is {'enabled' if Config.fast_validation else 'disabled'}")
 
         rcount = 0
 
@@ -278,7 +318,7 @@ class Config:
         if self.errors:
             self.logger.error("ERROR ERROR ERROR Starting with configuration errors")
 
-    def post_notice(self, msg: str, resource: Optional[Resource]=None) -> None:
+    def post_notice(self, msg: str, resource: Optional[Resource]=None, log_level=logging.DEBUG) -> None:
         if resource is None:
             resource = self.current_resource
 
@@ -289,10 +329,11 @@ class Config:
 
         notices = self.notices.setdefault(rkey, [])
         notices.append(msg)
-        self.logger.info("%s: NOTICE: %s" % (rkey, msg))
+
+        self.logger.log(log_level, "%s: NOTICE: %s" % (rkey, msg))
 
     @multi
-    def post_error(self, msg: Union[RichStatus, str], resource: Optional[Resource]=None, rkey: Optional[str]=None) -> str:
+    def post_error(self, msg: Union[RichStatus, str], resource: Optional[Resource]=None, rkey: Optional[str]=None, log_level=logging.INFO) -> str:
         del resource    # silence warnings
         del rkey
 
@@ -304,13 +345,13 @@ class Config:
             return type(msg).__name__
 
     @post_error.when('string')
-    def post_error_string(self, msg: str, resource: Optional[Resource]=None, rkey: Optional[str]=None):
+    def post_error_string(self, msg: str, resource: Optional[Resource]=None, rkey: Optional[str]=None, log_level=logging.INFO):
         rc = RichStatus.fromError(msg)
 
-        self.post_error(rc, resource=resource)
+        self.post_error(rc, resource=resource, log_level=log_level)
 
     @post_error.when('RichStatus')
-    def post_error_richstatus(self, rc: RichStatus, resource: Optional[Resource]=None, rkey: Optional[str]=None):
+    def post_error_richstatus(self, rc: RichStatus, resource: Optional[Resource]=None, rkey: Optional[str]=None, log_level=logging.INFO):
         if resource is None:
             resource = self.current_resource
 
@@ -326,7 +367,7 @@ class Config:
         errors = self.errors.setdefault(rkey, [])
         errors.append(rc.as_dict())
 
-        self.logger.error("%s: %s" % (rkey, rc))
+        self.logger.log(log_level, "%s: %s" % (rkey, rc))
 
     def process(self, resource: ACResource) -> RichStatus:
         # This should be impossible.
@@ -345,7 +386,11 @@ class Config:
         if 'name' not in resource:
             return RichStatus.fromError("need name")
 
-        # ...and off we go. Save the source info...
+        # ...and also make sure it has a namespace.
+        if not resource.get('namespace', None):
+            resource['namespace'] = self.ambassador_namespace
+
+        # ...it doesn't actually need a metadata_labels, so off we go. Save the source info...
         self.save_source(resource)
 
         # ...and figure out if this thing is OK.
@@ -393,15 +438,19 @@ class Config:
         apiVersion = resource.apiVersion
         originalApiVersion = apiVersion
 
-        # XXX HACK!
-        if apiVersion.startswith('getambassador.io/'):
-            apiVersion = apiVersion.replace('getambassador.io/', 'ambassador/')
+        # The Canonical API Version for our resources always starts with "getambassador.io/",
+        # but it used to always start with "ambassador/". Translate as needed for backward
+        # compatibility.
+
+        if apiVersion.startswith('ambassador/'):
+            apiVersion = apiVersion.replace('ambassador/', 'getambassador.io/')
             resource.apiVersion = apiVersion
 
         is_ambassador = False
 
-        # Ditch the leading ambassador/ that really needs to be there.
-        if apiVersion.startswith("ambassador/"):
+        # OK. If it really starts with getambassador.io/, we're good, and we can strip
+        # that off to make comparisons and keying easier.
+        if apiVersion.startswith("getambassador.io/"):
             is_ambassador = True
             apiVersion = apiVersion.split('/')[1]
         elif apiVersion.startswith('networking.internal.knative.dev'):
@@ -410,6 +459,9 @@ class Config:
             pass
         else:
             return RichStatus.fromError("apiVersion %s unsupported" % apiVersion)
+
+        ns = resource.get('namespace') or self.ambassador_namespace
+        name = f"{resource.name} ns {ns}"
 
         version = apiVersion.lower()
 
@@ -421,41 +473,195 @@ class Config:
                 self.post_notice(f"apiVersion {originalApiVersion} {status}", resource=resource)
 
         if resource.kind.lower() in Config.NoSchema:
-            return RichStatus.OK(msg=f"no schema for {resource.kind} so calling it good")
+            return RichStatus.OK(msg=f"no schema for {resource.kind} {name} so calling it good")
 
-        # Do we already have this schema loaded?
-        schema_key = "%s-%s" % (apiVersion, resource.kind)
-        schema = self.schemas.get(schema_key, None)
+        # OK, now we need to decide what more we need to do. Start by assuming that we will,
+        # in fact, need to do full schema validation for this object.
 
-        if not schema:
-            # Not loaded. Go find it on disk.
-            schema_path = os.path.join(self.schema_dir_path, apiVersion,
-                                       "%s.schema" % resource.kind)
+        need_validation = True
 
-            try:
-                # Load it up...
-                schema = json.load(open(schema_path, "r"))
+        # Next up: is the AMBASSADOR_FAST_VALIDATION flag set?
+        
+        if Config.fast_validation:
+            # Yes, so we _don't_ need to do validation here.
+            need_validation = False
 
-                # ...and then cache it, if it exists. Note that we'll never
-                # get here if we find something that doesn't parse.
-                if schema:
-                    self.schemas[schema_key] = typecast(Dict[Any, Any], schema)
-            except OSError:
-                self.logger.debug("no schema at %s, not validating" % schema_path)
-            except json.decoder.JSONDecodeError as e:
-                self.logger.warning("corrupt schema at %s, skipping (%s)" %
-                                    (schema_path, e))
+        # Finally, does the object specifically demand validation? (This is presently used
+        # for objects coming from annotations, since watt can't currently validate those.)
+        if resource.get('_force_validation', False):
+            # Yup, so we'll honor that. 
+            need_validation = True
+            del(resource['_force_validation'])
 
-        if schema:
-            # We have a schema. Does the object validate OK?
-            try:
-                jsonschema.validate(resource.as_dict(), schema)
-            except jsonschema.exceptions.ValidationError as e:
-                # Nope. Bzzzzt.
-                return RichStatus.fromError("not a valid %s: %s" % (resource.kind, e))
+        # Did watt find errors here? (This can only happen if AMBASSADOR_FAST_VALIDATION
+        # is enabled -- in a later version we'll short-circuit earlier, but for now we're
+        # going to re-validate as a check on watt.)
+
+        watt_errors = None
+
+        if 'errors' in resource:
+            # Pop the errors out of this resource, since we can't validate in Python
+            # while it's present!
+            errors = resource.pop('errors').split('\n')
+
+            # This weird list comprehension around 'errors' is just filtering out any
+            # empty lines.
+            watt_errors = '; '.join([error for error in errors if error])
+
+            if watt_errors:
+                # Yup, we really had errors here. Mark as needing re-validation for
+                # now.
+                need_validation = True
+
+        # OK, assume that we won't be validating so we can just report that...
+        rc = RichStatus.OK(msg=f"validation not needed for {apiVersion} {resource.kind} {name} so calling it good")
+
+        # ...then, let's see whether reality matches our assumption.
+        if need_validation:
+            # Aha, we need to do validation -- either fast validation isn't on, or it
+            # was requested, or watt reported errors. So if we can do validation, do it.
+
+            # Do we have a validator that can work on this object?
+            validator = self.get_validator(apiVersion, resource.kind)
+
+            if validator:
+                rc = validator(resource)
+            else:
+                # No validator, so, uh, call it good.
+                rc = RichStatus.OK(msg=f"no validator for {apiVersion} {resource.kind} {name} so calling it good")
+
+            if watt_errors:
+                # watt reported errors. Did we find errors or not?
+
+                if rc:
+                    # We did not. Post this into fast_validation_disagreements
+                    fvd = self.fast_validation_disagreements.setdefault(resource.rkey, [])
+                    fvd.append(watt_errors)
+                    self.logger.debug(f"validation disagreement: good {resource.kind} {name} has watt errors {watt_errors}")
+
+                    # Note that we override watt here by returning the successful
+                    # result from our validator. That's intentional in 1.6.0.
+                else:
+                    # We don't like it either. Stick with the watt errors (since we know,
+                    # a priori, that fast validation is enabled).
+                    rc = RichStatus.fromError(watt_errors)
+            
+        # One way or the other, we're done here. Finally.
+        self.logger.debug(f"validation {rc}")
+        return rc
+
+    def get_validator(self, apiVersion: str, kind: str) -> Validator:
+        schema_key = "%s-%s" % (apiVersion, kind)
+
+        validator = self.validators.get(schema_key, None)
+
+        if not validator:
+            validator = self.get_proto_validator(apiVersion, kind)
+
+        if not validator:
+            validator = self.get_jsonschema_validator(apiVersion, kind)
+
+        if not validator:
+            # Ew. Early binding for Python lambdas is kinda weird.
+            validator = typecast(Validator,
+                                 lambda resource, args=(apiVersion, kind): self.cannot_validate(*args))
+
+        if validator:
+            self.validators[schema_key] = validator
+
+        return validator
+
+    def cannot_validate(self, apiVersion: str, kind: str) -> RichStatus:
+        self.logger.debug(f"Cannot validate getambassador.io/{apiVersion} {kind}")
+
+        return RichStatus.OK(msg="Not validating getambassador.io/{apiVersion} {kind}")
+
+    def get_proto_validator(self, apiVersion, kind) -> Optional[Validator]:
+        # See if we can import a protoclass...
+        proto_modname = f"ambassador.proto.{apiVersion}.{kind}_pb2"
+        proto_classname = f"{kind}Spec"
+        m = None
+
+        try:
+            m = importlib.import_module(proto_modname)
+        except ModuleNotFoundError:
+            self.logger.debug(f"no proto in {proto_modname}")
+            return None
+
+        protoclass = getattr(m, proto_classname, None)
+
+        if not protoclass:
+            self.logger.debug(f"no class {proto_classname} in {proto_modname}")
+            return None
+
+        self.logger.debug(f"using validate_with_proto for getambassador.io/{apiVersion} {kind}")
+
+        # Ew. Early binding for Python lambdas is kinda weird.
+        return typecast(Validator,
+                        lambda resource, protoclass=protoclass: self.validate_with_proto(resource, protoclass))
+
+    def validate_with_proto(self, resource: ACResource, protoclass: Any) -> RichStatus:
+        # This is... a little odd.
+        #
+        # First, protobuf works with JSON, not dictionaries. Second, by the time we get here,
+        # the metadata has been folded in, and our *Spec protos (HostSpec, etc) don't include
+        # the metadata (by design).
+        #
+        # So. We make a copy, strip the metadata fields, serialize, and _then_ see if  we can
+        # parse it. Yuck.
+
+        rdict = resource.as_dict()
+        rdict.pop('apiVersion', None)
+        rdict.pop('kind', None)
+
+        name = rdict.pop('name', None)
+        namespace = rdict.pop('namespace', None)
+        metadata_labels = rdict.pop('metadata_labels', None)
+        generation = rdict.pop('generation', None)
+
+        serialized = json.dumps(rdict)
+
+        try:
+            json_format.Parse(serialized, protoclass())
+        except json_format.ParseError as e:
+            return RichStatus.fromError(str(e))
+
+        return RichStatus.OK(msg=f"good {resource.kind}")
+
+    def get_jsonschema_validator(self, apiVersion, kind) -> Optional[Validator]:
+        # Do we have a JSONSchema on disk for this?
+        schema_path = os.path.join(self.schema_dir_path, apiVersion, f"{kind}.schema")
+
+        try:
+            schema = json.load(open(schema_path, "r"))
+
+            # Note that we'll never get here if the schema doesn't parse.
+            if schema:
+                self.logger.debug(f"using validate_with_jsonschema for getambassador.io/{apiVersion} {kind}")
+
+                # Ew. Early binding for Python lambdas is kinda weird.
+                return typecast(Validator,
+                                lambda resource, schema=schema: self.validate_with_jsonschema(resource, schema))
+        except OSError:
+            self.logger.debug(f"no schema at {schema_path}, not validating")
+            return None
+        except json.decoder.JSONDecodeError as e:
+            self.logger.warning(f"corrupt schema at {schema_path}, skipping ({e})")
+            return None
+
+        # This can't actually happen -- the only way to get here is to have an uncaught
+        # exception. But it shuts up mypy so WTF.
+        return None
+
+    def validate_with_jsonschema(self, resource: ACResource, schema: dict) -> RichStatus:
+        try:
+            jsonschema.validate(resource.as_dict(), schema)
+        except jsonschema.exceptions.ValidationError as e:
+            # Nope. Bzzzzt.
+            return RichStatus.fromError(f"not a valid {resource.kind}: {e}")
 
         # All good. Return an OK.
-        return RichStatus.OK(msg="valid %s" % resource.kind)
+        return RichStatus.OK(msg=f"good {resource.kind}")
 
     def safe_store(self, storage_name: str, resource: ACResource, allow_log: bool=True) -> None:
         """
@@ -471,10 +677,18 @@ class Config:
         storage = self.config.setdefault(storage_name, {})
 
         if resource.name in storage:
-            # Oooops.
-            self.post_error("%s defines %s %s, which is already defined by %s" %
-                            (resource, resource.kind, resource.name, storage[resource.name].location),
-                            resource=resource)
+            if resource.namespace == storage[resource.name].get('namespace'):
+                # If the name and namespace, both match, then it's definitely an error.
+                # Oooops.
+                self.post_error("%s defines %s %s, which is already defined by %s" %
+                                (resource, resource.kind, resource.name, storage[resource.name].location),
+                                resource=resource)
+            else:
+                # Here, we deal with the case when multiple resources have the same name but they exist in different
+                # namespaces. Our current data structure to store resources is a flat string. Till we move to
+                # identifying resources with both, name and namespace, we change names of any subsequent resources with
+                # the same name here.
+                resource.name = f'{resource.name}.{resource.namespace}'
 
         if allow_log:
             self.logger.debug("%s: saving %s %s" %

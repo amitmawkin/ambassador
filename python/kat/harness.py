@@ -4,7 +4,7 @@ import sys
 from abc import ABC
 from collections import OrderedDict
 from hashlib import sha256
-from typing import Any, Callable, Dict, List, Sequence, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
 from packaging import version
 
 import base64
@@ -18,22 +18,60 @@ import time
 import threading
 import traceback
 
-from .manifests import KAT_CLIENT_POD, BACKEND_SERVICE, SUPERPOD_POD, CRDS, KNATIVE_SERVING_CRDS
+from .utils import ShellCommand
 
 from yaml.scanner import ScannerError as YAMLScanError
 
 from multi import multi
 from .parser import dump, load, Tag
+from .utils import namespace_manifest
+
+import yaml as pyyaml
+
+pyyaml_loader: Any = pyyaml.SafeLoader
+pyyaml_dumper: Any = pyyaml.SafeDumper
+
+try:
+    pyyaml_loader = pyyaml.CSafeLoader
+    pyyaml_dumper = pyyaml.CSafeDumper
+except AttributeError:
+    pass
+
+# Run mode can be local (don't do any Envoy stuff), envoy (only do Envoy stuff),
+# or all (allow both). Default is all.
+RUN_MODE = os.environ.get('KAT_RUN_MODE', 'all').lower()
+
+# Figure out if we're running in Edge Stack or what.
+EDGE_STACK = False
+GOLD_ROOT = "/buildroot/ambassador/python/tests/gold"
+MANIFEST_ROOT = "/buildroot/ambassador/python/tests/manifests"
+
+if os.path.exists("/buildroot/apro.version"):
+    # Hey look, we're running inside Edge Stack!
+    print("RUNNING IN EDGE STACK")
+    EDGE_STACK = True
+    GOLD_ROOT = "/buildroot/apro/tests/pytest/gold"
+    MANIFEST_ROOT = "/buildroot/apro/tests/pytest/manifests"
+    # RUN_MODE = "envoy"
+else:
+    print("RUNNING IN OSS")
+
+
+def load_manifest(manifest_name: str) -> str:
+    return open(os.path.join(MANIFEST_ROOT, f"{manifest_name.lower()}.yaml"), "r").read()
 
 
 class TestImage:
     def __init__(self, *args, **kwargs) -> None:
         self.images: Dict[str, str] = {}
 
+        default_registry = os.environ.get('TEST_SERVICE_REGISTRY', 'docker.io/datawire/test_services')
+        default_version = os.environ.get('TEST_SERVICE_VERSION', '0.0.3')
+
         for svc in ['auth', 'auth-tls', 'ratelimit', 'shadow', 'stats']:
             key = svc.replace('-', '_').upper()
 
-            image = os.environ[f'TEST_SERVICE_{key}']
+            image = os.environ.get(f'TEST_SERVICE_{key}', f'{default_registry}:test-{svc}-{default_version}')
 
             self.images[svc] = image
 
@@ -55,6 +93,26 @@ def kube_version_json():
     return json.loads(stdout)
 
 
+def strip_version(ver: str):
+    """
+    strip_version is needed to strip a major/minor version of non-standard symbols. For example, when working with GKE,
+    `kubectl version` returns a minor version like '14+', which is not semver or any standard version, for that matter.
+    So we handle exceptions like that here.
+    :param ver: version string
+    :return: stripped version
+    """
+
+    try:
+        return int(ver)
+    except ValueError as e:
+        # GKE returns weird versions with '+' in the end
+        if ver[-1] == '+':
+            return int(ver[:-1])
+
+        # If we still have not taken care of this, raise the error
+        raise ValueError(e)
+
+
 def kube_server_version(version_json=None):
     if not version_json:
         version_json = kube_version_json()
@@ -62,8 +120,8 @@ def kube_server_version(version_json=None):
     server_json = version_json.get('serverVersion', {})
 
     if server_json:
-        server_major = server_json.get('major', None)
-        server_minor = server_json.get('minor', None)
+        server_major = strip_version(server_json.get('major', None))
+        server_minor = strip_version(server_json.get('minor', None))
 
         return f"{server_major}.{server_minor}"
     else:
@@ -77,8 +135,8 @@ def kube_client_version(version_json=None):
     client_json = version_json.get('clientVersion', {})
 
     if client_json:
-        client_major = client_json.get('major', None)
-        client_minor = client_json.get('minor', None)
+        client_major = strip_version(client_json.get('major', None))
+        client_minor = strip_version(client_json.get('minor', None))
 
         return f"{client_major}.{client_minor}"
     else:
@@ -86,6 +144,10 @@ def kube_client_version(version_json=None):
 
 
 def is_knative():
+    # Skip KNative immediately for run_mode local.
+    if RUN_MODE == 'local':
+        return False
+
     is_cluster_compatible = True
     kube_json = kube_version_json()
 
@@ -93,7 +155,7 @@ def is_knative():
     client_version = kube_client_version(kube_json)
 
     if server_version:
-        if version.parse(server_version) < version.parse('1.11'):
+        if version.parse(server_version) < version.parse('1.14'):
             print(f"server version {server_version} is incompatible with Knative")
             is_cluster_compatible = False
         else:
@@ -102,7 +164,7 @@ def is_knative():
         print("could not determine Kubernetes server version?")
 
     if client_version:
-        if version.parse(client_version) < version.parse('1.10'):
+        if version.parse(client_version) < version.parse('1.14'):
             print(f"client version {client_version} is incompatible with Knative")
             is_cluster_compatible = False
         else:
@@ -123,7 +185,7 @@ def has_changed(data: str, path: str) -> Tuple[bool, str]:
     cur_size = len(data.strip()) if data else 0
     cur_hash = get_digest(data)
 
-    print(f'has_changed: data size {cur_size} - {cur_hash}')
+    # print(f'has_changed: data size {cur_size} - {cur_hash}')
 
     prev_data = None
     changed = True
@@ -139,7 +201,7 @@ def has_changed(data: str, path: str) -> Tuple[bool, str]:
     if prev_data:
         prev_hash = get_digest(prev_data)
 
-    print(f'has_changed: prev_data size {prev_size} - {prev_hash}')
+    # print(f'has_changed: prev_data size {prev_size} - {prev_hash}')
 
     if data:
         if data != prev_data:
@@ -149,7 +211,7 @@ def has_changed(data: str, path: str) -> Tuple[bool, str]:
             reason = f'same data in {path}'
 
         if changed:
-            print(f'has_changed: updating {path}')
+            # print(f'has_changed: updating {path}')
             with open(path, "w") as f:
                 f.write(data)
 
@@ -265,10 +327,13 @@ class Node(ABC):
     name: Name
     ambassador_id: str
     namespace: str = None  # type: ignore
+    is_ambassador = False
+    local_result: Optional[Dict[str, str]] = None
 
     def __init__(self, *args, **kwargs) -> None:
         # If self.skip is set to true, this node is skipped
         self.skip_node = False
+        self.xfail = None
 
         self.test_image = GLOBAL_TEST_IMAGE
 
@@ -329,6 +394,148 @@ class Node(ABC):
     def clone(self, name=None):
         return self.__class__(_clone=self, name=name)
 
+    def find_local_result(self, stop_at_first_ambassador: bool=False) -> Optional[Dict[str, str]]:
+        test_name = self.format('{self.path.k8s}')
+
+        # print(f"{test_name} {type(self)} FIND_LOCAL_RESULT")
+
+        end_result: Optional[Dict[str, str]] = None
+
+        n: Optional[Node] = self
+
+        while n:
+            node_name = n.format('{self.path.k8s}')
+            parent = n.parent
+            parent_name = parent.format('{self.path.k8s}') if parent else "-none-"
+
+            end_result = getattr(n, 'local_result', None)
+            result_str = end_result['result'] if end_result else '-none-'
+            # print(f"{test_name}: {'ambassador' if n.is_ambassador else 'node'} {node_name}, parent {parent_name}, local_result = {result_str}")
+
+            if end_result is not None:
+                break
+
+            if n.is_ambassador and stop_at_first_ambassador:
+                # This is an Ambassador: don't continue past it.
+                break
+
+            n = n.parent
+
+        return end_result
+
+    def check_local(self, gold_root: str, k8s_yaml_path: str) -> Tuple[bool, bool]:
+        testname = self.format('{self.path.k8s}')
+
+        if self.xfail:
+            # XFail early -- but still return True, True so that we don't try to run Envoy on it.
+            self.local_result = {
+                'result': 'xfail',
+                'reason': self.xfail
+            }
+            # print(f"==== XFAIL: {testname} local: {self.xfail}")
+            return (True, True)
+
+        if not self.is_ambassador:
+            # print(f"{testname} ({type(self)}) is not an Ambassador")
+            return (False, False)
+
+        if not self.ambassador_id:
+            print(f"{testname} ({type(self)}) is an Ambassador but has no ambassador_id?")
+            return (False, False)
+
+        ambassador_namespace = getattr(self, 'namespace', 'default')
+        ambassador_single_namespace = getattr(self, 'single_namespace', False)
+
+        no_local_mode: bool = getattr(self, 'no_local_mode', False)
+        skip_local_reason: Optional[str] = getattr(self, 'skip_local_instead_of_xfail', None)
+
+        # print(f"{testname}: ns {ambassador_namespace} ({'single' if ambassador_single_namespace else 'multi'})")
+
+        gold_path = os.path.join(gold_root, testname)
+
+        if os.path.isdir(gold_path) and not no_local_mode:
+            # print(f"==== {testname} running locally from {gold_path}")
+
+            # Yeah, I know, brutal hack.
+            # 
+            # XXX (Flynn) This code isn't used and we don't know if it works. If you try
+            # it, bring it up-to-date with the environment created in abstract_tests.py
+            envstuff = ["env", f"AMBASSADOR_NAMESPACE={ambassador_namespace}"]
+
+            cmd = ["mockery", k8s_yaml_path,
+                   "-w", "python /ambassador/watch_hook.py",
+                   "--kat", self.ambassador_id,
+                   "--diff", gold_path]
+
+            if ambassador_single_namespace:
+                envstuff.append("AMBASSADOR_SINGLE_NAMESPACE=yes")
+                cmd += ["-n", ambassador_namespace]
+
+            if not getattr(self, 'allow_edge_stack_redirect', False):
+                envstuff.append("AMBASSADOR_NO_TLS_REDIRECT=yes")
+
+            cmd = envstuff + cmd
+
+            w = ShellCommand(*cmd)
+
+            if w.status():
+                print(f"==== GOOD: {testname} local against {gold_path}")
+                self.local_result = {'result': "pass"}
+            else:
+                print(f"==== FAIL: {testname} local against {gold_path}")
+
+                self.local_result = {
+                    'result': 'fail',
+                    'stdout': w.stdout,
+                    'stderr': w.stderr
+                }
+
+            return (True, True)
+        else:
+            # If we have a local reason, has a parent already subsumed us?
+            #
+            # XXX The way KAT works, our parent will have always run earlier than us, so
+            # it's not clear if we can ever not have been subsumed.
+
+            if skip_local_reason:
+                local_result = self.find_local_result()
+
+                if local_result:
+                    self.local_result = {
+                        'result': 'skip',
+                        'reason': f"subsumed by {skip_local_reason} -- {local_result['result']}"
+                    }
+                    # print(f"==== {self.local_result['result'].upper()} {testname} {self.local_result['reason']}")
+                    return (True, True)
+
+            # OK, we weren't already subsumed. If we're in local mode, we'll skip or xfail
+            # depending on skip_local_reason.
+
+            if RUN_MODE == "local":
+                if skip_local_reason:
+                    self.local_result = {
+                        'result': 'skip',
+                        # 'reason': f"subsumed by {skip_local_reason} without result in local mode"
+                    }
+                    print(f"==== {self.local_result['result'].upper()} {testname} {self.local_result['reason']}")
+                    return (True, True)
+                else:
+                    # XFail -- but still return True, True so that we don't try to run Envoy on it.
+                    self.local_result = {
+                        'result': 'xfail',
+                        'reason': f"missing local cache {gold_path}"
+                    }
+                    # print(f"==== {self.local_result['result'].upper()} {testname} {self.local_result['reason']}")
+                    return (True, True)
+
+            # If here, we're not in local mode. Allow Envoy to run.
+            self.local_result = None
+            # print(f"==== IGNORE {testname} no local cache")
+            return (True, False)
+
+    def has_local_result(self) -> bool:
+        return bool(self.local_result)
+
     @classmethod
     def variants(cls):
         yield cls()
@@ -365,7 +572,13 @@ class Node(ABC):
             return self.parent.depth + 1
 
     def format(self, st, **kwargs):
-        return st.format(self=self, environ=os.environ, **kwargs)
+        serviceAccountExtra = ''
+        if os.environ.get("DEV_USE_IMAGEPULLSECRET", False):
+            serviceAccountExtra = """
+imagePullSecrets:
+- name: dev-image-pull-secret
+"""
+        return st.format(self=self, environ=os.environ, serviceAccountExtra=serviceAccountExtra, **kwargs)
 
     def get_fqdn(self, name: str) -> str:
         if self.namespace and (self.namespace != 'default'):
@@ -430,6 +643,34 @@ class Test(Node):
 
     def check(self):
         pass
+
+    def handle_local_result(self) -> bool:
+        test_name = self.format('{self.path.k8s}')
+
+        print(f"{test_name} {type(self)} HANDLE_LOCAL_RESULT")
+
+        end_result = self.find_local_result()
+
+        if end_result is not None:
+            result_type = end_result['result']
+
+            if result_type == 'pass':
+                pass
+            elif result_type == 'skip':
+                pytest.skip(end_result['reason'])
+            elif result_type == 'fail':
+                sys.stdout.write(end_result['stdout'])
+
+                if os.environ.get('KAT_VERBOSE', None):
+                    sys.stderr.write(end_result['stderr'])
+
+                pytest.fail("local check failed")
+            elif result_type == 'xfail':
+                pytest.xfail(end_result['reason'])
+
+            return True
+
+        return False
 
     @property
     def ambassador_id(self):
@@ -821,6 +1062,7 @@ class Superpod:
         return ports
 
     def get_manifest_list(self) -> List[Dict[str, Any]]:
+        SUPERPOD_POD = load_manifest("superpod_pod")
         manifest = load('superpod', SUPERPOD_POD.format(environ=os.environ), Tag.MAPPING)
 
         assert len(manifest) == 1, "SUPERPOD manifest must have exactly one object"
@@ -854,6 +1096,29 @@ class Superpod:
 
         return list(manifest)
 
+CLEARTEXT_HOST_YAML = '''
+---
+apiVersion: getambassador.io/v2
+kind: Host
+metadata:
+  name: cleartext-host-{self.path.k8s}
+  labels:
+    scope: AmbassadorTest
+  namespace: %s
+spec:
+  ambassador_id: [ "{self.ambassador_id}" ]
+  hostname: "*"
+  selector:
+    matchLabels:
+      hostname: {self.path.k8s}
+  acmeProvider:
+    authority: none
+  requestPolicy:
+    insecure:
+      action: Route
+      # additionalPort: 8080
+'''
+
 class Runner:
 
     def __init__(self, *classes, scope=None):
@@ -863,46 +1128,39 @@ class Runner:
         self.tests = [n for n in self.nodes if isinstance(n, Test)]
         self.ids = [t.path for t in self.tests]
         self.done = False
+        self.skip_nonlocal_tests = False
+        self.ids_to_strip: Dict[str, bool] = {}
+        self.names_to_ignore: Dict[str, bool] = {}
 
         @pytest.mark.parametrize("t", self.tests, ids=self.ids)
         def test(request, capsys, t):
-            selected = set(item.callspec.getparam('t') for item in request.session.items if item.function == test)
+            if t.xfail:
+                pytest.xfail(t.xfail)
+            else:
+                selected = set(item.callspec.getparam('t') for item in request.session.items if item.function == test)
 
-            with capsys.disabled():
-                self.setup(selected)
+                with capsys.disabled():
+                    self.setup(selected)
 
-            # XXX: should aggregate the result of url checks
-            for r in t.results:
-                r.check()
+                if not t.handle_local_result():
+                    # XXX: should aggregate the result of url checks
+                    i = 0
+                    for r in t.results:
+                        try:
+                            r.check()
+                        except AssertionError as e:
+                            # Add some context so that you can tell which query is failing.
+                            e.args = (f"query[{i}]: {e.args[0]}", *e.args[1:])
+                            raise
+                        i += 1
 
-            t.check()
+                    t.check()
 
         self.__func__ = test
         self.__test__ = True
 
     def __call__(self):
         assert False, "this is here for py.test discovery purposes only"
-
-    # def run(self):
-    #     for t in self.tests:
-    #         try:
-    #             self.setup(set(self.tests))
-    #
-    #             for r in t.results:
-    #                 print("%s - %s: checking (2)" % (r.parent.name, r.query.url))
-    #
-    #                 r.check()
-    #
-    #                 if r.query.expected != r.status:
-    #                     print("%s - %s: failed (2)" % (r.parent.name, r.query.url))
-    #                     assert (False,
-    #                             "%s: expected %s, got %s" % (r.query.url, r.query.expected, r.status or r.error))
-    #
-    #             t.check()
-    #
-    #             print("%s: PASSED" % t.name)
-    #         except:
-    #             print("%s: FAILED\n  %s" % (t.name, traceback.format_exc().replace("\n", "\n  ")))
 
     def setup(self, selected):
         if not self.done:
@@ -913,18 +1171,28 @@ class Runner:
 
             for s in selected:
                 for n in s.ancestors:
-                    expanded_up.add(n)
+                    if not n.xfail:
+                        expanded_up.add(n)
 
             expanded = set(expanded_up)
 
             for s in selected:
                 for n in s.traversal:
-                    expanded.add(n)
+                    if not n.xfail:
+                        expanded.add(n)
 
             try:
                 self._setup_k8s(expanded)
 
+                if self.skip_nonlocal_tests:
+                    self.done = True
+                    return
+
                 for t in self.tests:
+                    if t.has_local_result():
+                        # print(f"{t.name}: SKIP due to local result")
+                        continue
+
                     if t in expanded_up:
                         pre_query: Callable = getattr(t, "pre_query", None)
 
@@ -939,10 +1207,10 @@ class Runner:
                 self.done = True
 
     def get_manifests(self, selected) -> OrderedDict:
-        manifests = OrderedDict()  # type: ignore
+        manifests: OrderedDict[Union[Superpod,Node], list] = OrderedDict()  # type: ignore
         superpods: Dict[str, Superpod] = {}
 
-        for n in (n for n in self.nodes if n in selected):
+        for n in (n for n in self.nodes if n in selected and not n.xfail):
             manifest = None
             nsp = None
             ambassador_id = None
@@ -980,6 +1248,7 @@ class Runner:
                 # print(f'superpodifying {n.name}')
 
                 # Next up: use the BACKEND_SERVICE manifest as a template...
+                BACKEND_SERVICE = load_manifest("backend_service")
                 yaml = n.format(BACKEND_SERVICE)
                 manifest = load(n.path, yaml, Tag.MAPPING)
 
@@ -1004,6 +1273,15 @@ class Runner:
                 yaml = n.manifests()
 
                 if yaml is not None:
+                    add_cleartext_host = getattr(n, 'edge_stack_cleartext_host', False)
+                    is_plain_test = n.path.k8s.startswith("plain-")
+
+                    if EDGE_STACK and n.is_ambassador and add_cleartext_host and not is_plain_test:
+                        # print(f"{n.path.k8s} adding Host")
+
+                        host_yaml = CLEARTEXT_HOST_YAML % nsp
+                        yaml += host_yaml
+
                     yaml = n.format(yaml)
 
                     try:
@@ -1033,68 +1311,40 @@ class Runner:
                             metadata['namespace'] = nsp
 
                 # ...and, finally, save the manifest list.
-                manifests[n] = manifest
+                manifests[n] = list(manifest)
 
         for superpod in superpods.values():
             manifests[superpod] = superpod.get_manifest_list()
 
         return manifests
 
+    def do_local_checks(self, selected, fname) -> bool:
+        if RUN_MODE == 'envoy':
+            print("Local mode not allowed, continuing to Envoy mode")
+            return False
+
+        all_valid = True
+        self.ids_to_strip = {}
+        # This feels a bit wrong?
+        self.names_to_ignore = {}
+
+        for n in (n for n in self.nodes if n in selected):
+            local_possible, local_checked = n.check_local(GOLD_ROOT, fname)
+
+            if local_possible:
+                if local_checked:
+                    self.ids_to_strip[n.ambassador_id] = True
+                else:
+                    all_valid = False
+
+        return all_valid
+
     def _setup_k8s(self, selected):
-        # First up: CRDs.
-        final_crds = CRDS
-        if is_knative():
-            final_crds += KNATIVE_SERVING_CRDS
-
-        changed, reason = has_changed(final_crds, "/tmp/k8s-CRDs.yaml")
-
-        if changed:
-            print(f'CRDS changed ({reason}), applying.')
-            run(f'kubectl apply -f /tmp/k8s-CRDs.yaml')
-
-            tries_left = 10
-
-            while os.system('kubectl get crd mappings.getambassador.io > /dev/null 2>&1') != 0:
-                tries_left -= 1
-
-                if tries_left <= 0:
-                    raise RuntimeError("CRDs never became available")
-
-                print("sleeping for CRDs... (%d)" % tries_left)
-                time.sleep(5)
-        else:
-            print(f'CRDS unchanged {reason}, skipping apply.')
-
-        # Next up: the KAT pod.
-        changed, reason = has_changed(KAT_CLIENT_POD.format(environ=os.environ), "/tmp/k8s-kat-pod.yaml")
-
-        if changed:
-            print(f'KAT pod definition changed ({reason}), applying')
-            run('kubectl apply -f /tmp/k8s-kat-pod.yaml')
-
-            tries_left = 10
-
-            while True:
-                pods = self._pods(None)
-
-                if pods.get('kat', False):
-                    print("KAT pod ready")
-                    break
-
-                tries_left -= 1
-
-                if tries_left <= 0:
-                    raise RuntimeError("KAT pod never became available")
-
-                print("sleeping for KAT pod... (%d)" % tries_left)
-                time.sleep(5)
-        else:
-            print(f'KAT pod definition unchanged {reason}, skipping apply.')
-
+        # First up, get the full manifest and save it to disk.
         manifests = self.get_manifests(selected)
 
         configs = OrderedDict()
-        for n in (n for n in self.nodes if n in selected):
+        for n in (n for n in self.nodes if n in selected and not n.xfail):
             configs[n] = []
             for cfg in n.config():
                 if isinstance(cfg, str):
@@ -1152,6 +1402,139 @@ class Runner:
 
         fname = "/tmp/k8s-%s.yaml" % self.scope
 
+        self.applied_manifests = False
+
+        # Always apply at this point, since we're doing the multi-run thing.
+        manifest_changed, manifest_reason = has_changed(yaml, fname)
+
+        # OK. Try running local stuff.
+        if self.do_local_checks(selected, fname):
+            # Everything that could run locally did. Good enough.
+            self.skip_nonlocal_tests = True
+            return True
+
+        # Something didn't work out quite right.
+        print(f'Continuing with Kube tests...')
+        # print(f"ids_to_strip {self.ids_to_strip}")
+
+        # XXX It is _so stupid_ that we're reparsing the whole manifest here.
+        xxx_crap = pyyaml.load_all(open(fname, "r").read(), Loader=pyyaml_loader)
+
+        # Strip things we don't need from the manifest.
+        trimmed_manifests = []
+        trimmed = 0
+        kept = 0
+
+        for obj in xxx_crap:
+            keep = True
+
+            kind = '-nokind-'
+            name = '-noname-'
+            metadata: Dict[str, Any] = {}
+            labels: Dict[str, str] = {}
+            id_to_check: Optional[str] = None
+
+            if 'kind' in obj:
+                kind = obj['kind']
+
+            if 'metadata' in obj:
+                metadata = obj['metadata']
+
+            if 'name' in metadata:
+                name = metadata['name']
+
+            if 'labels' in metadata:
+                labels = metadata['labels']
+
+            if 'kat-ambassador-id' in labels:
+                id_to_check = labels['kat-ambassador-id']
+
+            # print(f"metadata {metadata} id_to_check {id_to_check} obj {obj}")
+
+            # Keep namespaces, just in case.
+            if kind == 'Namespace':
+                keep = True
+            else:
+                if id_to_check and (id_to_check in self.ids_to_strip):
+                    keep = False
+                    # print(f"...drop {kind} {name} (ID {id_to_check})")
+                    self.names_to_ignore[name] = True
+
+            if keep:
+                kept += 1
+                trimmed_manifests.append(obj)
+            else:
+                trimmed += 1
+
+        if trimmed:
+            print(f"After trimming: kept {kept}, trimmed {trimmed}")
+
+        yaml = pyyaml.dump_all(trimmed_manifests, Dumper=pyyaml_dumper)
+
+        fname = "/tmp/k8s-%s-trimmed.yaml" % self.scope
+
+        self.applied_manifests = False
+
+        # Always apply at this point, since we're doing the multi-run thing.
+        manifest_changed, manifest_reason = has_changed(yaml, fname)
+
+        # First up: CRDs.
+        CRDS = load_manifest("crds")
+        final_crds = CRDS
+
+        if is_knative():
+            KNATIVE_SERVING_CRDS = load_manifest("knative_serving_crds")
+            final_crds += KNATIVE_SERVING_CRDS
+
+        changed, reason = has_changed(final_crds, "/tmp/k8s-CRDs.yaml")
+
+        if changed:
+            print(f'CRDS changed ({reason}), applying.')
+            run(f'kubectl apply -f /tmp/k8s-CRDs.yaml')
+
+            tries_left = 10
+
+            while os.system('kubectl get crd mappings.getambassador.io > /dev/null 2>&1') != 0:
+                tries_left -= 1
+
+                if tries_left <= 0:
+                    raise RuntimeError("CRDs never became available")
+
+                print("sleeping for CRDs... (%d)" % tries_left)
+                time.sleep(5)
+        else:
+            print(f'CRDS unchanged {reason}, skipping apply.')
+
+
+        # Next up: the KAT pod.
+        KAT_CLIENT_POD = load_manifest("kat_client_pod")
+        if os.environ.get("DEV_USE_IMAGEPULLSECRET", False):
+            KAT_CLIENT_POD = namespace_manifest("default") + KAT_CLIENT_POD
+        changed, reason = has_changed(KAT_CLIENT_POD.format(environ=os.environ), "/tmp/k8s-kat-pod.yaml")
+
+        if changed:
+            print(f'KAT pod definition changed ({reason}), applying')
+            run('kubectl apply -f /tmp/k8s-kat-pod.yaml')
+
+            tries_left = 10
+            time.sleep(1)
+            
+            while True:
+                if ShellCommand.run("check for KAT pod",
+                                    'kubectl', 'exec', 'kat', 'echo', 'hello'):
+                    print("KAT pod ready")
+                    break
+
+                tries_left -= 1
+
+                if tries_left <= 0:
+                    raise RuntimeError("KAT pod never became available")
+
+                print("sleeping for KAT pod... (%d)" % tries_left)
+                time.sleep(5)
+        else:
+            print(f'KAT pod definition unchanged {reason}, skipping apply.')
+
         # # Clear out old stuff.
         # print("Clearing cluster...")
         # ShellCommand.run('clear old Kubernetes namespaces',
@@ -1161,22 +1544,14 @@ class Runner:
         #                  'kubectl', 'delete', 'all', '-l', 'scope=AmbassadorTest', '--all-namespaces',
         #                  verbose=True)
 
-        self.applied_manifests = False
-
-        # Always apply at this point, since we're doing the multi-run thing.
-        changed, reason = has_changed(yaml, fname)
-
-        if changed:
-            print(f'Manifests changed ({reason}), applying.')
-
-            # XXX: better prune selector label
+        # XXX: better prune selector label
+        if manifest_changed:
+            print(f"manifest changed ({manifest_reason}), applying...")
             run("kubectl apply --prune -l scope=%s -f %s" % (self.scope, fname))
             self.applied_manifests = True
-        else:
-            print(f'Manifests unchanged ({reason}), applying.')
 
         for n in self.nodes:
-            if n in selected:
+            if n in selected and not n.xfail:
                 action = getattr(n, "post_manifest", None)
                 if action:
                     action()
@@ -1186,9 +1561,45 @@ class Runner:
         print("Waiting 5s after requirements, just because...")
         time.sleep(5)
 
+    @staticmethod
+    def _req_str(kind, req) -> str:
+        printable = req
+
+        if kind == 'url':
+            printable = req.url
+
+        return printable
+
     def _wait(self, selected):
-        requirements = [ (node, kind, name) for node in self.nodes for kind, name in node.requirements()
-                         if node in selected ]
+        requirements = []
+
+        for node in selected:
+            if node.xfail:
+                continue
+
+            node_name = node.format("{self.path.k8s}")
+            ambassador_id = getattr(node, 'ambassador_id', None)
+
+            # print(f"{node_name} {ambassador_id}")
+
+            if node.has_local_result():
+                # print(f"{node_name} has local result, skipping")
+                continue
+
+            if ambassador_id and ambassador_id in self.ids_to_strip:
+                # print(f"{node_name} has id {ambassador_id}, stripping")
+                continue
+
+            if node_name in self.names_to_ignore:
+                # print(f"{node_name} marked to ignore, stripping")
+                continue
+
+            # if RUN_MODE != "envoy":
+            #     print(f"{node_name}: including in nonlocal tests")
+
+            for kind, req in node.requirements():
+                # print(f"{node_name} add req ({node_name}, {kind}, {self._req_str(kind, req)})")
+                requirements.append((node, kind, req))
 
         homogenous = {}
 
@@ -1215,6 +1626,10 @@ class Runner:
                 reqs = homogenous[kind]
 
                 print("Checking %s %s requirements... " % (len(reqs), kind), end="")
+
+                # print("\n")
+                # for node, req in reqs:
+                #     print(f"...{node.format('{self.path.k8s}')} - {self._req_str(kind, req)}")
 
                 sys.stdout.flush()
 
@@ -1325,15 +1740,30 @@ class Runner:
         queries = []
 
         for t in self.tests:
+            t_name = t.format('{self.path.k8s}')
+
             if t in selected:
                 t.pending = []
                 t.queried = []
                 t.results = []
+            else:
+                continue
 
-                for q in t.queries():
-                    q.parent = t
-                    t.pending.append(q)
-                    queries.append(q)
+            if t.has_local_result():
+                # print(f"{t_name}: SKIP QUERY due to local result")
+                continue
+        
+            ambassador_id = getattr(t, 'ambassador_id', None)
+            
+            if ambassador_id and ambassador_id in self.ids_to_strip:
+                # print(f"{t_name}: SKIP QUERY due to ambassador_id {ambassador_id}")
+                continue
+                
+            # print(f"{t_name}: INCLUDE QUERY")
+            for q in t.queries():
+                q.parent = t
+                t.pending.append(q)
+                queries.append(q)
 
         phases = sorted(set([q.phase for q in queries]))
 

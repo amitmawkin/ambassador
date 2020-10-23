@@ -15,7 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/gogo/protobuf/types"
+	"github.com/golang/protobuf/ptypes"
 )
 
 // ensure the imports are used
@@ -30,8 +30,11 @@ var (
 	_ = time.Duration(0)
 	_ = (*url.URL)(nil)
 	_ = (*mail.Address)(nil)
-	_ = types.DynamicAny{}
+	_ = ptypes.DynamicAny{}
 )
+
+// define the regex for a UUID once up-front
+var _fault_uuidPattern = regexp.MustCompile("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 // Validate checks the field values on FaultAbort with the rules defined in the
 // proto definition for this message. If any rules are violated, an error is returned.
@@ -40,17 +43,12 @@ func (m *FaultAbort) Validate() error {
 		return nil
 	}
 
-	{
-		tmp := m.GetPercentage()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return FaultAbortValidationError{
-					field:  "Percentage",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetPercentage()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return FaultAbortValidationError{
+				field:  "Percentage",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
@@ -63,6 +61,18 @@ func (m *FaultAbort) Validate() error {
 			return FaultAbortValidationError{
 				field:  "HttpStatus",
 				reason: "value must be inside range [200, 600)",
+			}
+		}
+
+	case *FaultAbort_HeaderAbort_:
+
+		if v, ok := interface{}(m.GetHeaderAbort()).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return FaultAbortValidationError{
+					field:  "HeaderAbort",
+					reason: "embedded message failed validation",
+					cause:  err,
+				}
 			}
 		}
 
@@ -138,32 +148,22 @@ func (m *HTTPFault) Validate() error {
 		return nil
 	}
 
-	{
-		tmp := m.GetDelay()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return HTTPFaultValidationError{
-					field:  "Delay",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetDelay()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return HTTPFaultValidationError{
+				field:  "Delay",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
 
-	{
-		tmp := m.GetAbort()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return HTTPFaultValidationError{
-					field:  "Abort",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetAbort()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return HTTPFaultValidationError{
+				field:  "Abort",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
@@ -173,49 +173,34 @@ func (m *HTTPFault) Validate() error {
 	for idx, item := range m.GetHeaders() {
 		_, _ = idx, item
 
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return HTTPFaultValidationError{
-						field:  fmt.Sprintf("Headers[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return HTTPFaultValidationError{
+					field:  fmt.Sprintf("Headers[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
 
 	}
 
-	{
-		tmp := m.GetMaxActiveFaults()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return HTTPFaultValidationError{
-					field:  "MaxActiveFaults",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetMaxActiveFaults()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return HTTPFaultValidationError{
+				field:  "MaxActiveFaults",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
 
-	{
-		tmp := m.GetResponseRateLimit()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return HTTPFaultValidationError{
-					field:  "ResponseRateLimit",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetResponseRateLimit()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return HTTPFaultValidationError{
+				field:  "ResponseRateLimit",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
@@ -288,3 +273,70 @@ var _ interface {
 	Cause() error
 	ErrorName() string
 } = HTTPFaultValidationError{}
+
+// Validate checks the field values on FaultAbort_HeaderAbort with the rules
+// defined in the proto definition for this message. If any rules are
+// violated, an error is returned.
+func (m *FaultAbort_HeaderAbort) Validate() error {
+	if m == nil {
+		return nil
+	}
+
+	return nil
+}
+
+// FaultAbort_HeaderAbortValidationError is the validation error returned by
+// FaultAbort_HeaderAbort.Validate if the designated constraints aren't met.
+type FaultAbort_HeaderAbortValidationError struct {
+	field  string
+	reason string
+	cause  error
+	key    bool
+}
+
+// Field function returns field value.
+func (e FaultAbort_HeaderAbortValidationError) Field() string { return e.field }
+
+// Reason function returns reason value.
+func (e FaultAbort_HeaderAbortValidationError) Reason() string { return e.reason }
+
+// Cause function returns cause value.
+func (e FaultAbort_HeaderAbortValidationError) Cause() error { return e.cause }
+
+// Key function returns key value.
+func (e FaultAbort_HeaderAbortValidationError) Key() bool { return e.key }
+
+// ErrorName returns error name.
+func (e FaultAbort_HeaderAbortValidationError) ErrorName() string {
+	return "FaultAbort_HeaderAbortValidationError"
+}
+
+// Error satisfies the builtin error interface
+func (e FaultAbort_HeaderAbortValidationError) Error() string {
+	cause := ""
+	if e.cause != nil {
+		cause = fmt.Sprintf(" | caused by: %v", e.cause)
+	}
+
+	key := ""
+	if e.key {
+		key = "key for "
+	}
+
+	return fmt.Sprintf(
+		"invalid %sFaultAbort_HeaderAbort.%s: %s%s",
+		key,
+		e.field,
+		e.reason,
+		cause)
+}
+
+var _ error = FaultAbort_HeaderAbortValidationError{}
+
+var _ interface {
+	Field() string
+	Reason() string
+	Key() bool
+	Cause() error
+	ErrorName() string
+} = FaultAbort_HeaderAbortValidationError{}

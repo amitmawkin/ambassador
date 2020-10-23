@@ -9,18 +9,24 @@
 .skip_test_warning
 venv
 __pycache__
-VERSION.py
 .pytest_cache
 .mypy_cache
+
+# local files
+*.local
+*.local.sh
 
 # binaries
 /bin_*/
 
+vendor_bootstrap_hack.go
+
 /tools/sandbox/grpc_auth/docker-compose.yml
 /tools/sandbox/grpc_web/docker-compose.yaml
-/tools/sandbox/grpc_web/*_pb.js
 /tools/sandbox/http_auth/docker-compose.yml
 
+/docker/container.txt
+/docker/container.txt.stamp
 *.docker
 *.docker.stamp
 *.docker.tag.*
@@ -33,6 +39,7 @@ dist
 *.out
 *.log
 *.tmp
+*.bak
 log.txt
 
 # From `make update-aws`
@@ -71,11 +78,18 @@ ambassador-deployment-*.yaml
 ambassador-secrets-deployment.yaml
 *failures.txt
 *.swp
+.ambassador_ignore_ingress_class
 
 # --- Files ignored by older versions ---
 # Remove the tail of this list when the commit making the change gets
 # far enough in to the past.
 
+# 2020-08-20
+/cxx/envoy/
+/cxx/envoy-static
+/cxx/envoy-build-image.txt
+/cxx/envoy-build-container.txt
+/cxx/go-control-plane/
 # 2019-10-13
 /build/kat/client/kat_client
 /build/kat/client/teleproxy

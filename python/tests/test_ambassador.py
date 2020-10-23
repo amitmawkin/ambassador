@@ -1,4 +1,4 @@
-from kat.harness import Runner
+from kat.harness import Runner, EDGE_STACK
 
 from abstract_tests import AmbassadorTest
 
@@ -9,13 +9,17 @@ import t_cors
 import t_extauth
 import t_grpc
 import t_grpc_bridge
+import t_grpc_stats
 import t_grpc_web
 import t_gzip
 import t_headerrouting
+import t_hosts
+import t_ip_allow_deny
 import t_loadbalancer
 import t_logservice
 import t_lua_scripts
 import t_mappingtests
+import t_no_ui
 import t_optiontests
 import t_plain
 import t_ratelimit
@@ -27,10 +31,14 @@ import t_tls
 import t_tracing
 import t_retrypolicy
 import t_consul
-#import t_circuitbreaker
-import t_knative
+import t_circuitbreaker
 import t_envoy_logs
 import t_ingress
+import t_listeneridletimeout
+import t_cluster_tag
+import t_queryparameter_routing
+import t_request_header
+import t_regexrewrite_forwarding
 
 # pytest will find this because Runner is a toplevel callable object in a file
 # that pytest is willing to look inside.

@@ -15,7 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/gogo/protobuf/types"
+	"github.com/golang/protobuf/ptypes"
 )
 
 // ensure the imports are used
@@ -30,8 +30,11 @@ var (
 	_ = time.Duration(0)
 	_ = (*url.URL)(nil)
 	_ = (*mail.Address)(nil)
-	_ = types.DynamicAny{}
+	_ = ptypes.DynamicAny{}
 )
+
+// define the regex for a UUID once up-front
+var _config_dump_uuidPattern = regexp.MustCompile("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 // Validate checks the field values on ConfigDump with the rules defined in the
 // proto definition for this message. If any rules are violated, an error is returned.
@@ -43,17 +46,12 @@ func (m *ConfigDump) Validate() error {
 	for idx, item := range m.GetConfigs() {
 		_, _ = idx, item
 
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return ConfigDumpValidationError{
-						field:  fmt.Sprintf("Configs[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return ConfigDumpValidationError{
+					field:  fmt.Sprintf("Configs[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
@@ -117,6 +115,95 @@ var _ interface {
 	ErrorName() string
 } = ConfigDumpValidationError{}
 
+// Validate checks the field values on UpdateFailureState with the rules
+// defined in the proto definition for this message. If any rules are
+// violated, an error is returned.
+func (m *UpdateFailureState) Validate() error {
+	if m == nil {
+		return nil
+	}
+
+	if v, ok := interface{}(m.GetFailedConfiguration()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return UpdateFailureStateValidationError{
+				field:  "FailedConfiguration",
+				reason: "embedded message failed validation",
+				cause:  err,
+			}
+		}
+	}
+
+	if v, ok := interface{}(m.GetLastUpdateAttempt()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return UpdateFailureStateValidationError{
+				field:  "LastUpdateAttempt",
+				reason: "embedded message failed validation",
+				cause:  err,
+			}
+		}
+	}
+
+	// no validation rules for Details
+
+	return nil
+}
+
+// UpdateFailureStateValidationError is the validation error returned by
+// UpdateFailureState.Validate if the designated constraints aren't met.
+type UpdateFailureStateValidationError struct {
+	field  string
+	reason string
+	cause  error
+	key    bool
+}
+
+// Field function returns field value.
+func (e UpdateFailureStateValidationError) Field() string { return e.field }
+
+// Reason function returns reason value.
+func (e UpdateFailureStateValidationError) Reason() string { return e.reason }
+
+// Cause function returns cause value.
+func (e UpdateFailureStateValidationError) Cause() error { return e.cause }
+
+// Key function returns key value.
+func (e UpdateFailureStateValidationError) Key() bool { return e.key }
+
+// ErrorName returns error name.
+func (e UpdateFailureStateValidationError) ErrorName() string {
+	return "UpdateFailureStateValidationError"
+}
+
+// Error satisfies the builtin error interface
+func (e UpdateFailureStateValidationError) Error() string {
+	cause := ""
+	if e.cause != nil {
+		cause = fmt.Sprintf(" | caused by: %v", e.cause)
+	}
+
+	key := ""
+	if e.key {
+		key = "key for "
+	}
+
+	return fmt.Sprintf(
+		"invalid %sUpdateFailureState.%s: %s%s",
+		key,
+		e.field,
+		e.reason,
+		cause)
+}
+
+var _ error = UpdateFailureStateValidationError{}
+
+var _ interface {
+	Field() string
+	Reason() string
+	Key() bool
+	Cause() error
+	ErrorName() string
+} = UpdateFailureStateValidationError{}
+
 // Validate checks the field values on BootstrapConfigDump with the rules
 // defined in the proto definition for this message. If any rules are
 // violated, an error is returned.
@@ -125,32 +212,22 @@ func (m *BootstrapConfigDump) Validate() error {
 		return nil
 	}
 
-	{
-		tmp := m.GetBootstrap()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return BootstrapConfigDumpValidationError{
-					field:  "Bootstrap",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetBootstrap()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return BootstrapConfigDumpValidationError{
+				field:  "Bootstrap",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
 
-	{
-		tmp := m.GetLastUpdated()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return BootstrapConfigDumpValidationError{
-					field:  "LastUpdated",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetLastUpdated()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return BootstrapConfigDumpValidationError{
+				field:  "LastUpdated",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
@@ -227,77 +304,27 @@ func (m *ListenersConfigDump) Validate() error {
 	for idx, item := range m.GetStaticListeners() {
 		_, _ = idx, item
 
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return ListenersConfigDumpValidationError{
-						field:  fmt.Sprintf("StaticListeners[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return ListenersConfigDumpValidationError{
+					field:  fmt.Sprintf("StaticListeners[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
 
 	}
 
-	for idx, item := range m.GetDynamicActiveListeners() {
+	for idx, item := range m.GetDynamicListeners() {
 		_, _ = idx, item
 
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return ListenersConfigDumpValidationError{
-						field:  fmt.Sprintf("DynamicActiveListeners[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
-				}
-			}
-		}
-
-	}
-
-	for idx, item := range m.GetDynamicWarmingListeners() {
-		_, _ = idx, item
-
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return ListenersConfigDumpValidationError{
-						field:  fmt.Sprintf("DynamicWarmingListeners[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
-				}
-			}
-		}
-
-	}
-
-	for idx, item := range m.GetDynamicDrainingListeners() {
-		_, _ = idx, item
-
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return ListenersConfigDumpValidationError{
-						field:  fmt.Sprintf("DynamicDrainingListeners[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return ListenersConfigDumpValidationError{
+					field:  fmt.Sprintf("DynamicListeners[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
@@ -376,17 +403,12 @@ func (m *ClustersConfigDump) Validate() error {
 	for idx, item := range m.GetStaticClusters() {
 		_, _ = idx, item
 
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return ClustersConfigDumpValidationError{
-						field:  fmt.Sprintf("StaticClusters[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return ClustersConfigDumpValidationError{
+					field:  fmt.Sprintf("StaticClusters[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
@@ -396,17 +418,12 @@ func (m *ClustersConfigDump) Validate() error {
 	for idx, item := range m.GetDynamicActiveClusters() {
 		_, _ = idx, item
 
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return ClustersConfigDumpValidationError{
-						field:  fmt.Sprintf("DynamicActiveClusters[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return ClustersConfigDumpValidationError{
+					field:  fmt.Sprintf("DynamicActiveClusters[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
@@ -416,17 +433,12 @@ func (m *ClustersConfigDump) Validate() error {
 	for idx, item := range m.GetDynamicWarmingClusters() {
 		_, _ = idx, item
 
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return ClustersConfigDumpValidationError{
-						field:  fmt.Sprintf("DynamicWarmingClusters[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return ClustersConfigDumpValidationError{
+					field:  fmt.Sprintf("DynamicWarmingClusters[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
@@ -503,17 +515,12 @@ func (m *RoutesConfigDump) Validate() error {
 	for idx, item := range m.GetStaticRouteConfigs() {
 		_, _ = idx, item
 
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return RoutesConfigDumpValidationError{
-						field:  fmt.Sprintf("StaticRouteConfigs[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return RoutesConfigDumpValidationError{
+					field:  fmt.Sprintf("StaticRouteConfigs[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
@@ -523,17 +530,12 @@ func (m *RoutesConfigDump) Validate() error {
 	for idx, item := range m.GetDynamicRouteConfigs() {
 		_, _ = idx, item
 
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return RoutesConfigDumpValidationError{
-						field:  fmt.Sprintf("DynamicRouteConfigs[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return RoutesConfigDumpValidationError{
+					field:  fmt.Sprintf("DynamicRouteConfigs[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
@@ -608,17 +610,12 @@ func (m *ScopedRoutesConfigDump) Validate() error {
 	for idx, item := range m.GetInlineScopedRouteConfigs() {
 		_, _ = idx, item
 
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return ScopedRoutesConfigDumpValidationError{
-						field:  fmt.Sprintf("InlineScopedRouteConfigs[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return ScopedRoutesConfigDumpValidationError{
+					field:  fmt.Sprintf("InlineScopedRouteConfigs[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
@@ -628,17 +625,12 @@ func (m *ScopedRoutesConfigDump) Validate() error {
 	for idx, item := range m.GetDynamicScopedRouteConfigs() {
 		_, _ = idx, item
 
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return ScopedRoutesConfigDumpValidationError{
-						field:  fmt.Sprintf("DynamicScopedRouteConfigs[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return ScopedRoutesConfigDumpValidationError{
+					field:  fmt.Sprintf("DynamicScopedRouteConfigs[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
@@ -715,17 +707,12 @@ func (m *SecretsConfigDump) Validate() error {
 	for idx, item := range m.GetStaticSecrets() {
 		_, _ = idx, item
 
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return SecretsConfigDumpValidationError{
-						field:  fmt.Sprintf("StaticSecrets[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return SecretsConfigDumpValidationError{
+					field:  fmt.Sprintf("StaticSecrets[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
@@ -735,17 +722,12 @@ func (m *SecretsConfigDump) Validate() error {
 	for idx, item := range m.GetDynamicActiveSecrets() {
 		_, _ = idx, item
 
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return SecretsConfigDumpValidationError{
-						field:  fmt.Sprintf("DynamicActiveSecrets[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return SecretsConfigDumpValidationError{
+					field:  fmt.Sprintf("DynamicActiveSecrets[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
@@ -755,17 +737,12 @@ func (m *SecretsConfigDump) Validate() error {
 	for idx, item := range m.GetDynamicWarmingSecrets() {
 		_, _ = idx, item
 
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return SecretsConfigDumpValidationError{
-						field:  fmt.Sprintf("DynamicWarmingSecrets[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return SecretsConfigDumpValidationError{
+					field:  fmt.Sprintf("DynamicWarmingSecrets[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
@@ -839,32 +816,22 @@ func (m *ListenersConfigDump_StaticListener) Validate() error {
 		return nil
 	}
 
-	{
-		tmp := m.GetListener()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return ListenersConfigDump_StaticListenerValidationError{
-					field:  "Listener",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetListener()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return ListenersConfigDump_StaticListenerValidationError{
+				field:  "Listener",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
 
-	{
-		tmp := m.GetLastUpdated()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return ListenersConfigDump_StaticListenerValidationError{
-					field:  "LastUpdated",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetLastUpdated()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return ListenersConfigDump_StaticListenerValidationError{
+				field:  "LastUpdated",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
@@ -929,6 +896,96 @@ var _ interface {
 	ErrorName() string
 } = ListenersConfigDump_StaticListenerValidationError{}
 
+// Validate checks the field values on ListenersConfigDump_DynamicListenerState
+// with the rules defined in the proto definition for this message. If any
+// rules are violated, an error is returned.
+func (m *ListenersConfigDump_DynamicListenerState) Validate() error {
+	if m == nil {
+		return nil
+	}
+
+	// no validation rules for VersionInfo
+
+	if v, ok := interface{}(m.GetListener()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return ListenersConfigDump_DynamicListenerStateValidationError{
+				field:  "Listener",
+				reason: "embedded message failed validation",
+				cause:  err,
+			}
+		}
+	}
+
+	if v, ok := interface{}(m.GetLastUpdated()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return ListenersConfigDump_DynamicListenerStateValidationError{
+				field:  "LastUpdated",
+				reason: "embedded message failed validation",
+				cause:  err,
+			}
+		}
+	}
+
+	return nil
+}
+
+// ListenersConfigDump_DynamicListenerStateValidationError is the validation
+// error returned by ListenersConfigDump_DynamicListenerState.Validate if the
+// designated constraints aren't met.
+type ListenersConfigDump_DynamicListenerStateValidationError struct {
+	field  string
+	reason string
+	cause  error
+	key    bool
+}
+
+// Field function returns field value.
+func (e ListenersConfigDump_DynamicListenerStateValidationError) Field() string { return e.field }
+
+// Reason function returns reason value.
+func (e ListenersConfigDump_DynamicListenerStateValidationError) Reason() string { return e.reason }
+
+// Cause function returns cause value.
+func (e ListenersConfigDump_DynamicListenerStateValidationError) Cause() error { return e.cause }
+
+// Key function returns key value.
+func (e ListenersConfigDump_DynamicListenerStateValidationError) Key() bool { return e.key }
+
+// ErrorName returns error name.
+func (e ListenersConfigDump_DynamicListenerStateValidationError) ErrorName() string {
+	return "ListenersConfigDump_DynamicListenerStateValidationError"
+}
+
+// Error satisfies the builtin error interface
+func (e ListenersConfigDump_DynamicListenerStateValidationError) Error() string {
+	cause := ""
+	if e.cause != nil {
+		cause = fmt.Sprintf(" | caused by: %v", e.cause)
+	}
+
+	key := ""
+	if e.key {
+		key = "key for "
+	}
+
+	return fmt.Sprintf(
+		"invalid %sListenersConfigDump_DynamicListenerState.%s: %s%s",
+		key,
+		e.field,
+		e.reason,
+		cause)
+}
+
+var _ error = ListenersConfigDump_DynamicListenerStateValidationError{}
+
+var _ interface {
+	Field() string
+	Reason() string
+	Key() bool
+	Cause() error
+	ErrorName() string
+} = ListenersConfigDump_DynamicListenerStateValidationError{}
+
 // Validate checks the field values on ListenersConfigDump_DynamicListener with
 // the rules defined in the proto definition for this message. If any rules
 // are violated, an error is returned.
@@ -937,34 +994,44 @@ func (m *ListenersConfigDump_DynamicListener) Validate() error {
 		return nil
 	}
 
-	// no validation rules for VersionInfo
+	// no validation rules for Name
 
-	{
-		tmp := m.GetListener()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return ListenersConfigDump_DynamicListenerValidationError{
-					field:  "Listener",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetActiveState()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return ListenersConfigDump_DynamicListenerValidationError{
+				field:  "ActiveState",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
 
-	{
-		tmp := m.GetLastUpdated()
+	if v, ok := interface{}(m.GetWarmingState()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return ListenersConfigDump_DynamicListenerValidationError{
+				field:  "WarmingState",
+				reason: "embedded message failed validation",
+				cause:  err,
+			}
+		}
+	}
 
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
+	if v, ok := interface{}(m.GetDrainingState()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return ListenersConfigDump_DynamicListenerValidationError{
+				field:  "DrainingState",
+				reason: "embedded message failed validation",
+				cause:  err,
+			}
+		}
+	}
 
-			if err := v.Validate(); err != nil {
-				return ListenersConfigDump_DynamicListenerValidationError{
-					field:  "LastUpdated",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetErrorState()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return ListenersConfigDump_DynamicListenerValidationError{
+				field:  "ErrorState",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
@@ -1037,32 +1104,22 @@ func (m *ClustersConfigDump_StaticCluster) Validate() error {
 		return nil
 	}
 
-	{
-		tmp := m.GetCluster()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return ClustersConfigDump_StaticClusterValidationError{
-					field:  "Cluster",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetCluster()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return ClustersConfigDump_StaticClusterValidationError{
+				field:  "Cluster",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
 
-	{
-		tmp := m.GetLastUpdated()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return ClustersConfigDump_StaticClusterValidationError{
-					field:  "LastUpdated",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetLastUpdated()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return ClustersConfigDump_StaticClusterValidationError{
+				field:  "LastUpdated",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
@@ -1137,32 +1194,22 @@ func (m *ClustersConfigDump_DynamicCluster) Validate() error {
 
 	// no validation rules for VersionInfo
 
-	{
-		tmp := m.GetCluster()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return ClustersConfigDump_DynamicClusterValidationError{
-					field:  "Cluster",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetCluster()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return ClustersConfigDump_DynamicClusterValidationError{
+				field:  "Cluster",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
 
-	{
-		tmp := m.GetLastUpdated()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return ClustersConfigDump_DynamicClusterValidationError{
-					field:  "LastUpdated",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetLastUpdated()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return ClustersConfigDump_DynamicClusterValidationError{
+				field:  "LastUpdated",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
@@ -1235,32 +1282,22 @@ func (m *RoutesConfigDump_StaticRouteConfig) Validate() error {
 		return nil
 	}
 
-	{
-		tmp := m.GetRouteConfig()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return RoutesConfigDump_StaticRouteConfigValidationError{
-					field:  "RouteConfig",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetRouteConfig()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return RoutesConfigDump_StaticRouteConfigValidationError{
+				field:  "RouteConfig",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
 
-	{
-		tmp := m.GetLastUpdated()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return RoutesConfigDump_StaticRouteConfigValidationError{
-					field:  "LastUpdated",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetLastUpdated()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return RoutesConfigDump_StaticRouteConfigValidationError{
+				field:  "LastUpdated",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
@@ -1335,32 +1372,22 @@ func (m *RoutesConfigDump_DynamicRouteConfig) Validate() error {
 
 	// no validation rules for VersionInfo
 
-	{
-		tmp := m.GetRouteConfig()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return RoutesConfigDump_DynamicRouteConfigValidationError{
-					field:  "RouteConfig",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetRouteConfig()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return RoutesConfigDump_DynamicRouteConfigValidationError{
+				field:  "RouteConfig",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
 
-	{
-		tmp := m.GetLastUpdated()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return RoutesConfigDump_DynamicRouteConfigValidationError{
-					field:  "LastUpdated",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetLastUpdated()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return RoutesConfigDump_DynamicRouteConfigValidationError{
+				field:  "LastUpdated",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
@@ -1439,34 +1466,24 @@ func (m *ScopedRoutesConfigDump_InlineScopedRouteConfigs) Validate() error {
 	for idx, item := range m.GetScopedRouteConfigs() {
 		_, _ = idx, item
 
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return ScopedRoutesConfigDump_InlineScopedRouteConfigsValidationError{
-						field:  fmt.Sprintf("ScopedRouteConfigs[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return ScopedRoutesConfigDump_InlineScopedRouteConfigsValidationError{
+					field:  fmt.Sprintf("ScopedRouteConfigs[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
 
 	}
 
-	{
-		tmp := m.GetLastUpdated()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return ScopedRoutesConfigDump_InlineScopedRouteConfigsValidationError{
-					field:  "LastUpdated",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetLastUpdated()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return ScopedRoutesConfigDump_InlineScopedRouteConfigsValidationError{
+				field:  "LastUpdated",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
@@ -1486,7 +1503,9 @@ type ScopedRoutesConfigDump_InlineScopedRouteConfigsValidationError struct {
 }
 
 // Field function returns field value.
-func (e ScopedRoutesConfigDump_InlineScopedRouteConfigsValidationError) Field() string { return e.field }
+func (e ScopedRoutesConfigDump_InlineScopedRouteConfigsValidationError) Field() string {
+	return e.field
+}
 
 // Reason function returns reason value.
 func (e ScopedRoutesConfigDump_InlineScopedRouteConfigsValidationError) Reason() string {
@@ -1550,34 +1569,24 @@ func (m *ScopedRoutesConfigDump_DynamicScopedRouteConfigs) Validate() error {
 	for idx, item := range m.GetScopedRouteConfigs() {
 		_, _ = idx, item
 
-		{
-			tmp := item
-
-			if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-				if err := v.Validate(); err != nil {
-					return ScopedRoutesConfigDump_DynamicScopedRouteConfigsValidationError{
-						field:  fmt.Sprintf("ScopedRouteConfigs[%v]", idx),
-						reason: "embedded message failed validation",
-						cause:  err,
-					}
+		if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return ScopedRoutesConfigDump_DynamicScopedRouteConfigsValidationError{
+					field:  fmt.Sprintf("ScopedRouteConfigs[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
 				}
 			}
 		}
 
 	}
 
-	{
-		tmp := m.GetLastUpdated()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return ScopedRoutesConfigDump_DynamicScopedRouteConfigsValidationError{
-					field:  "LastUpdated",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetLastUpdated()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return ScopedRoutesConfigDump_DynamicScopedRouteConfigsValidationError{
+				field:  "LastUpdated",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
@@ -1607,7 +1616,9 @@ func (e ScopedRoutesConfigDump_DynamicScopedRouteConfigsValidationError) Reason(
 }
 
 // Cause function returns cause value.
-func (e ScopedRoutesConfigDump_DynamicScopedRouteConfigsValidationError) Cause() error { return e.cause }
+func (e ScopedRoutesConfigDump_DynamicScopedRouteConfigsValidationError) Cause() error {
+	return e.cause
+}
 
 // Key function returns key value.
 func (e ScopedRoutesConfigDump_DynamicScopedRouteConfigsValidationError) Key() bool { return e.key }
@@ -1659,32 +1670,22 @@ func (m *SecretsConfigDump_DynamicSecret) Validate() error {
 
 	// no validation rules for VersionInfo
 
-	{
-		tmp := m.GetLastUpdated()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return SecretsConfigDump_DynamicSecretValidationError{
-					field:  "LastUpdated",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetLastUpdated()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return SecretsConfigDump_DynamicSecretValidationError{
+				field:  "LastUpdated",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
 
-	{
-		tmp := m.GetSecret()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return SecretsConfigDump_DynamicSecretValidationError{
-					field:  "Secret",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetSecret()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return SecretsConfigDump_DynamicSecretValidationError{
+				field:  "Secret",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
@@ -1759,32 +1760,22 @@ func (m *SecretsConfigDump_StaticSecret) Validate() error {
 
 	// no validation rules for Name
 
-	{
-		tmp := m.GetLastUpdated()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return SecretsConfigDump_StaticSecretValidationError{
-					field:  "LastUpdated",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetLastUpdated()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return SecretsConfigDump_StaticSecretValidationError{
+				field:  "LastUpdated",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}
 
-	{
-		tmp := m.GetSecret()
-
-		if v, ok := interface{}(tmp).(interface{ Validate() error }); ok {
-
-			if err := v.Validate(); err != nil {
-				return SecretsConfigDump_StaticSecretValidationError{
-					field:  "Secret",
-					reason: "embedded message failed validation",
-					cause:  err,
-				}
+	if v, ok := interface{}(m.GetSecret()).(interface{ Validate() error }); ok {
+		if err := v.Validate(); err != nil {
+			return SecretsConfigDump_StaticSecretValidationError{
+				field:  "Secret",
+				reason: "embedded message failed validation",
+				cause:  err,
 			}
 		}
 	}

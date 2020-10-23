@@ -1,7 +1,8 @@
-from kat.harness import variants, Query
+from kat.harness import EDGE_STACK, variants, Query
 
 from abstract_tests import AmbassadorTest, HTTP
 from abstract_tests import MappingTest, OptionTest, ServiceType
+from kat.utils import namespace_manifest
 
 # This is the place to add new MappingTests.
 
@@ -14,43 +15,6 @@ def unique(options):
             added.add(o.__class__)
             result.append(o)
     return tuple(result)
-
-
-class SimpleMapping(MappingTest):
-
-    parent: AmbassadorTest
-    target: ServiceType
-
-    @classmethod
-    def variants(cls):
-        for st in variants(ServiceType):
-            yield cls(st, name="{self.target.name}")
-
-            for mot in variants(OptionTest):
-                yield cls(st, (mot,), name="{self.target.name}-{self.options[0].name}")
-
-            yield cls(st, unique(v for v in variants(OptionTest)
-                                 if not getattr(v, "isolated", False)), name="{self.target.name}-all")
-
-    def config(self):
-        yield self, self.format("""
----
-apiVersion: ambassador/v1
-kind:  Mapping
-name:  {self.name}
-prefix: /{self.name}/
-service: http://{self.target.path.fqdn}
-""")
-
-    def queries(self):
-        yield Query(self.parent.url(self.name + "/"))
-        yield Query(self.parent.url(f'need-normalization/../{self.name}/'))
-
-    def check(self):
-        for r in self.results:
-            if r.backend:
-                assert r.backend.name == self.target.path.k8s, (r.backend.name, self.target.path.k8s)
-                assert r.backend.request.headers['x-envoy-original-path'][0] == f'/{self.name}/'
 
 
 class SimpleMapping(MappingTest):
@@ -128,6 +92,42 @@ spec:
             if r.backend:
                 assert r.backend.name == self.target.path.k8s, (r.backend.name, self.target.path.k8s)
                 assert r.backend.request.headers['x-envoy-original-path'][0] == f'/{self.name}/'
+
+# Disabled SimpleMappingIngressDefaultBackend since adding a default fallback mapping would break other
+# assertions, expecting to 404 if mappings don't match in Plain.
+# class SimpleMappingIngressDefaultBackend(MappingTest):
+#
+#     parent: AmbassadorTest
+#     target: ServiceType
+#
+#     @classmethod
+#     def variants(cls):
+#         for st in variants(ServiceType):
+#             yield cls(st, name="{self.target.name}")
+#
+#     def manifests(self) -> str:
+#         return f"""
+# apiVersion: extensions/v1beta1
+# kind: Ingress
+# metadata:
+#   annotations:
+#     kubernetes.io/ingress.class: ambassador
+#     getambassador.io/ambassador-id: plain
+#   name: {self.name.lower()}
+# spec:
+#   backend:
+#     serviceName: {self.target.path.k8s}
+#     servicePort: 80
+# """
+#
+#     def queries(self):
+#         yield Query(self.parent.url(self.name))
+#
+#     def check(self):
+#         for r in self.results:
+#             if r.backend:
+#                 assert r.backend.name == self.target.path.k8s, (r.backend.name, self.target.path.k8s)
+#                 assert r.backend.request.headers['x-envoy-original-path'][0] == f'/{self.name}'
 
 
 class SimpleIngressWithAnnotations(MappingTest):
@@ -568,6 +568,35 @@ add_response_headers:
                 assert r.headers['Test'] == ['Test', 'boo']
                 assert r.headers['Foo'] == ['Foo']
 
+# To make sure queries to Edge stack related paths adds X-Content-Type-Options = nosniff in the response header
+# and not to any other mappings/routes
+class EdgeStackMapping(MappingTest):
+    parent: AmbassadorTest
+    target: ServiceType
+
+    def init(self):
+        MappingTest.init(self, HTTP())
+ 
+        if not EDGE_STACK:
+            self.skip_node = True
+
+    def config(self):
+        yield self.target, self.format("""
+---
+apiVersion: ambassador/v0
+kind:  Mapping
+name:  {self.name}
+prefix: /{self.name}/
+service: http://{self.target.path.fqdn}
+""")
+
+    def queries(self):
+        yield Query(self.parent.url("edge_stack/admin/"), expected=200)
+        yield Query(self.parent.url(self.name + "/"), expected=200)
+
+    def check(self):
+        assert self.results[0].headers['X-Content-Type-Options'] == ['nosniff']
+        assert "X-Content-Type-Options" not in self.results[1].headers
 
 class RemoveReqHeadersMapping(MappingTest):
     parent: AmbassadorTest
@@ -668,12 +697,22 @@ kind:  Module
 name:  ambassador
 config:
   add_linkerd_headers: true
+  defaults:
+    httpmapping:
+        add_request_headers:
+            fruit:
+                append: False
+                value: orange
+        remove_request_headers:
+        - x-evil-header
 ---
 apiVersion: ambassador/v1
 kind: Mapping
 name: {self.target_add_linkerd_header_only.path.k8s}
 prefix: /target_add_linkerd_header_only/
 service: {self.target_add_linkerd_header_only.path.fqdn}
+add_request_headers: {{}}
+remove_request_headers: []
 ---
 apiVersion: ambassador/v1
 kind: Mapping
@@ -681,10 +720,6 @@ name: {self.target_no_header.path.k8s}
 prefix: /target_no_header/
 service: {self.target_no_header.path.fqdn}
 add_linkerd_headers: false
-add_request_headers:
-    fruit:
-        append: False
-        value: orange
 ---
 apiVersion: ambassador/v1
 kind: Mapping
@@ -695,17 +730,19 @@ add_request_headers:
     fruit:
         append: False
         value: banana
+remove_request_headers:
+- x-evilness
 """)
 
     def queries(self):
         # [0] expect Linkerd headers set through mapping
-        yield Query(self.url("target/"), expected=200)
+        yield Query(self.url("target/"), headers={ "x-evil-header": "evilness", "x-evilness": "more evilness" }, expected=200)
 
         # [1] expect no Linkerd headers
-        yield Query(self.url("target_no_header/"), expected=200)
+        yield Query(self.url("target_no_header/"), headers={ "x-evil-header": "evilness", "x-evilness": "more evilness" }, expected=200)
 
         # [2] expect Linkerd headers only
-        yield Query(self.url("target_add_linkerd_header_only/"), expected=200)
+        yield Query(self.url("target_add_linkerd_header_only/"), headers={ "x-evil-header": "evilness", "x-evilness": "more evilness" }, expected=200)
         
     def check(self):
         # [0]
@@ -713,12 +750,90 @@ add_request_headers:
         assert self.results[0].backend.request.headers['l5d-dst-override'] == ["{}:80".format(self.target.path.fqdn)]
         assert len(self.results[0].backend.request.headers['fruit']) > 0
         assert self.results[0].backend.request.headers['fruit'] == [ 'banana']
+        assert len(self.results[0].backend.request.headers['x-evil-header']) > 0
+        assert self.results[0].backend.request.headers['x-evil-header'] == [ 'evilness' ]
+        assert 'x-evilness' not in self.results[0].backend.request.headers
 
         # [1]
         assert 'l5d-dst-override' not in self.results[1].backend.request.headers
         assert len(self.results[1].backend.request.headers['fruit']) > 0
         assert self.results[1].backend.request.headers['fruit'] == [ 'orange']
+        assert 'x-evil-header' not in self.results[1].backend.request.headers
+        assert len(self.results[1].backend.request.headers['x-evilness']) > 0
+        assert self.results[1].backend.request.headers['x-evilness'] == [ 'more evilness' ]
 
         # [2]
         assert len(self.results[2].backend.request.headers['l5d-dst-override']) > 0
         assert self.results[2].backend.request.headers['l5d-dst-override'] == ["{}:80".format(self.target_add_linkerd_header_only.path.fqdn)]
+        assert len(self.results[2].backend.request.headers['x-evil-header']) > 0
+        assert self.results[2].backend.request.headers['x-evil-header'] == [ 'evilness' ]
+        assert len(self.results[2].backend.request.headers['x-evilness']) > 0
+        assert self.results[2].backend.request.headers['x-evilness'] == [ 'more evilness' ]
+
+
+class SameMappingDifferentNamespaces(AmbassadorTest):
+    target: ServiceType
+
+    def init(self):
+        self.target = HTTP()
+
+    def manifests(self) -> str:
+        return namespace_manifest('same-mapping-1') + \
+            namespace_manifest('same-mapping-2') + \
+            self.format('''
+---
+apiVersion: getambassador.io/v2
+kind: Mapping
+metadata:
+  name: {self.target.path.k8s}
+  namespace: same-mapping-1
+spec:
+  ambassador_id: {self.ambassador_id}
+  prefix: /{self.name}-1/
+  service: {self.target.path.fqdn}.default
+---
+apiVersion: getambassador.io/v2
+kind: Mapping
+metadata:
+  name: {self.target.path.k8s}
+  namespace: same-mapping-2
+spec:
+  ambassador_id: {self.ambassador_id}
+  prefix: /{self.name}-2/
+  service: {self.target.path.fqdn}.default
+''') + super().manifests()
+
+    def queries(self):
+        yield Query(self.url(self.name + "-1/"))
+        yield Query(self.url(self.name + "-2/"))
+
+
+class LongClusterNameMapping(AmbassadorTest):
+    target: ServiceType
+
+    def init(self):
+        self.target = HTTP()
+
+    def manifests(self) -> str:
+        return self.format('''
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: thisisaverylongservicenameoverwithsixythreecharacters123456789
+spec:
+  type: ExternalName
+  externalName: httpbin.org
+---
+apiVersion: getambassador.io/v2
+kind: Mapping
+metadata:
+  name: {self.target.path.k8s}
+spec:
+  ambassador_id: {self.ambassador_id}
+  prefix: /{self.name}-1/
+  service: thisisaverylongservicenameoverwithsixythreecharacters123456789
+''') + super().manifests()
+
+    def queries(self):
+        yield Query(self.url(self.name + "-1/"))
